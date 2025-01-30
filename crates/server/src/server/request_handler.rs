@@ -1,19 +1,23 @@
 // Copyright 2015-2021 Benjamin Fry <benjaminfry@me.com>
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
 //! Request Handler for incoming requests
 
 use std::net::SocketAddr;
 
+use hickory_proto::ProtoError;
+
 use crate::{
     authority::MessageRequest,
-    client::op::LowerQuery,
-    proto::op::{Header, ResponseCode},
-    server::{Protocol, ResponseHandler},
+    proto::{
+        op::{Header, LowerQuery, ResponseCode},
+        xfer::Protocol,
+    },
+    server::ResponseHandler,
 };
 
 /// An incoming request to the DNS catalog
@@ -40,13 +44,15 @@ impl Request {
     }
 
     /// Return just the header and request information from the Request Message
-    pub fn request_info(&self) -> RequestInfo<'_> {
-        RequestInfo {
+    ///
+    /// Returns an error if there is not exactly one query
+    pub fn request_info(&self) -> Result<RequestInfo<'_>, ProtoError> {
+        Ok(RequestInfo {
             src: self.src,
             protocol: self.protocol,
             header: self.message.header(),
-            query: self.message.query(),
-        }
+            query: self.message.raw_queries().try_as_query()?,
+        })
     }
 
     /// The IP address from which the request originated.
@@ -71,6 +77,7 @@ impl std::ops::Deref for Request {
 // TODO: add ProtocolInfo that would have TLS details or other additional things...
 /// A narrow view of the Request, specifically a verified single query for the request
 #[non_exhaustive]
+#[derive(Clone)]
 pub struct RequestInfo<'a> {
     /// The source address from which the request came
     pub src: SocketAddr,
@@ -107,7 +114,7 @@ impl<'a> RequestInfo<'a> {
 }
 
 /// Information about the response sent for a request
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[repr(transparent)]
 pub struct ResponseInfo(Header);
 
@@ -147,4 +154,25 @@ pub trait RequestHandler: Send + Sync + Unpin + 'static {
         request: &Request,
         response_handle: R,
     ) -> ResponseInfo;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::op::{Header, Query};
+
+    #[test]
+    fn request_info_clone() {
+        let query: Query = Query::new();
+        let header = Header::new();
+        let lower_query = query.into();
+        let origin = RequestInfo::new(
+            "127.0.0.1:3000".parse().unwrap(),
+            Protocol::Udp,
+            &header,
+            &lower_query,
+        );
+        let cloned = origin.clone();
+        assert_eq!(origin.header, cloned.header);
+    }
 }

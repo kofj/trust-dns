@@ -1,0 +1,26 @@
+user = "nobody"
+group = "nogroup"
+
+[[zones]]
+zone = "{{ fqdn }}"
+zone_type = "Primary"
+file = "/etc/zones/main.zone"
+nx_proof_kind = { nsec3 = { iterations = 1 } }
+
+{% if use_dnssec %}
+[[zones.keys]]
+{% if use_pkcs8 %}
+key_path = "/etc/zones/zsk.pk8"
+{% else %}
+key_path = "/etc/zones/zsk.key"
+{% endif %}
+algorithm = "RSASHA256"
+purpose = "ZoneSigning"
+{% endif %}
+
+{% for zone in additional_zones -%}
+[[zones]]
+zone = "{{ zone }}"
+zone_type = "Primary"
+file = "/etc/zones/{{ zone }}zone"
+{% endfor -%}

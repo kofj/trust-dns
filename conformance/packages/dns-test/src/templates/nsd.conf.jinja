@@ -1,0 +1,16 @@
+server:
+    pidfile: /tmp/nsd.pid
+
+remote-control:
+  control-enable: yes
+  control-interface: /run/unbound.ctl
+
+zone:
+  name: {{ fqdn }}
+  zonefile: /etc/zones/main.zone
+
+{% for zone in additional_zones -%}
+zone:
+  name: {{ zone }}
+  zonefile: /etc/zones/{{ zone }}zone
+{% endfor -%}
