@@ -5,7 +5,7 @@
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ *     https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,17 +19,19 @@
 
 mod edns;
 pub mod header;
+mod lower_query;
 pub mod message;
 pub mod op_code;
 pub mod query;
 pub mod response_code;
+pub mod update_message;
 
-pub use self::edns::Edns;
+pub use self::edns::{Edns, EdnsFlags};
 pub use self::header::Header;
 pub use self::header::MessageType;
-pub use self::message::{
-    Message, MessageFinalizer, MessageParts, MessageVerifier, NoopMessageFinalizer,
-};
+pub use self::message::{Message, MessageFinalizer, MessageParts, MessageVerifier};
 pub use self::op_code::OpCode;
 pub use self::query::Query;
 pub use self::response_code::ResponseCode;
+pub use lower_query::LowerQuery;
+pub use update_message::UpdateMessage;
