@@ -1,26 +1,22 @@
 // Copyright 2015-2018 Benjamin Fry <benjaminfry@me.com>
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
 //! Labels are used as the internal components of a Name.
 //!
 //! A label is stored internally as ascii, where all unicode characters are converted to punycode internally.
 
-#[allow(clippy::useless_attribute)]
-#[allow(unused)]
-#[allow(deprecated)]
-use std::ascii::AsciiExt;
 use std::borrow::Borrow;
 use std::cmp::{Ordering, PartialEq};
 use std::fmt::{self, Debug, Display, Formatter, Write};
 use std::hash::{Hash, Hasher};
-use tinyvec::TinyVec;
 
-use idna;
-use log::debug;
+use idna::uts46::{AsciiDenyList, DnsLength, Hyphens, Uts46};
+use tinyvec::TinyVec;
+use tracing::debug;
 
 use crate::error::*;
 
@@ -37,8 +33,14 @@ impl Label {
     /// This uses the bytes as raw ascii values, with nothing escaped on the wire.
     /// Generally users should use `from_str` or `from_ascii`
     pub fn from_raw_bytes(bytes: &[u8]) -> ProtoResult<Self> {
+        // Check for label validity.
+        // RFC 2181, Section 11 "Name Syntax".
+        // > The length of any one label is limited to between 1 and 63 octets.
+        if bytes.is_empty() {
+            return Err("Label requires a minimum length of 1".into());
+        }
         if bytes.len() > 63 {
-            return Err(format!("Label exceeds maximum length 63: {}", bytes.len()).into());
+            return Err(ProtoErrorKind::LabelBytesTooLong(bytes.len()).into());
         };
         Ok(Self(TinyVec::from(bytes)))
     }
@@ -54,14 +56,17 @@ impl Label {
             return Self::from_ascii(s);
         }
 
-        match idna::Config::default()
-            .use_std3_ascii_rules(true)
-            .transitional_processing(true)
-            .verify_dns_length(true)
-            .to_ascii(s)
-        {
+        // length don't exceeding 63 is done in `from_ascii`
+        // on puny encoded string
+        // idna error are opaque so early failure is not possible.
+        match Uts46::new().to_ascii(
+            s.as_bytes(),
+            AsciiDenyList::STD3,
+            Hyphens::Allow,
+            DnsLength::Ignore,
+        ) {
             Ok(puny) => Self::from_ascii(&puny),
-            e => Err(format!("Label contains invalid characters: {:?}", e).into()),
+            e => Err(format!("Label contains invalid characters: {e:?}").into()),
         }
     }
 
@@ -69,6 +74,10 @@ impl Label {
     ///
     /// This will return an Error if the label is not an ascii string
     pub fn from_ascii(s: &str) -> ProtoResult<Self> {
+        if s.len() > 63 {
+            return Err(ProtoErrorKind::LabelBytesTooLong(s.len()).into());
+        }
+
         if s.as_bytes() == WILDCARD {
             return Ok(Self::wildcard());
         }
@@ -80,7 +89,7 @@ impl Label {
         {
             Self::from_raw_bytes(s.as_bytes())
         } else {
-            Err(format!("Malformed label: {}", s).into())
+            Err(format!("Malformed label: {s}").into())
         }
     }
 
@@ -111,7 +120,7 @@ impl Label {
         self.as_bytes() == WILDCARD
     }
 
-    /// Returns the lenght in bytes of this label
+    /// Returns the length in bytes of this label
     pub fn len(&self) -> usize {
         self.0.len()
     }
@@ -150,7 +159,7 @@ impl Label {
 
     /// Performs the conversion to utf8 from IDNA as necessary, see `fmt` for more details
     pub fn to_utf8(&self) -> String {
-        format!("{}", self)
+        format!("{self}")
     }
 
     /// Converts this label to safe ascii, escaping characters as necessary
@@ -172,8 +181,8 @@ impl Label {
             f: &mut W,
             is_first: bool,
         ) -> Result<(), fmt::Error> {
-            let to_triple_escape = |ch: u8| format!("\\{:03o}", ch);
-            let to_single_escape = |ch: char| format!("\\{}", ch);
+            let to_triple_escape = |ch: u8| format!("\\{ch:03o}");
+            let to_single_escape = |ch: char| format!("\\{ch}");
 
             match char::from(byte) {
                 c if is_safe_ascii(c, is_first, true) => f.write_char(c)?,
@@ -232,11 +241,8 @@ impl Display for Label {
         if self.as_bytes().starts_with(IDNA_PREFIX) {
             // this should never be outside the ascii codes...
             let label = String::from_utf8_lossy(self.borrow());
-            let (label, e) = idna::Config::default()
-                .use_std3_ascii_rules(false)
-                .transitional_processing(false)
-                .verify_dns_length(false)
-                .to_unicode(&label);
+            let (label, e) =
+                Uts46::new().to_unicode(label.as_bytes(), AsciiDenyList::EMPTY, Hyphens::Allow);
 
             if e.is_ok() {
                 return f.write_str(&label);
@@ -319,7 +325,7 @@ pub trait IntoLabel: Sized {
     fn into_label(self) -> ProtoResult<Label>;
 }
 
-impl<'a> IntoLabel for &'a Label {
+impl IntoLabel for &Label {
     fn into_label(self) -> ProtoResult<Label> {
         Ok(self.clone())
     }
@@ -331,7 +337,7 @@ impl IntoLabel for Label {
     }
 }
 
-impl<'a> IntoLabel for &'a str {
+impl IntoLabel for &str {
     fn into_label(self) -> ProtoResult<Label> {
         Label::from_utf8(self)
     }
@@ -343,7 +349,7 @@ impl IntoLabel for String {
     }
 }
 
-impl<'a> IntoLabel for &'a [u8] {
+impl IntoLabel for &[u8] {
     fn into_label(self) -> ProtoResult<Label> {
         Label::from_raw_bytes(self)
     }
@@ -388,6 +394,70 @@ mod tests {
         assert_eq!(Label::from_utf8("🦀").unwrap().to_ascii(), "xn--zs9h");
     }
 
+    fn assert_panic_label_too_long(error: ProtoResult<Label>, len: usize) {
+        // poor man debug since ProtoResult don't implement Partial Eq due to ssl errors.
+        eprintln!("{error:?}");
+        assert!(error.is_err());
+        match error.unwrap_err().kind() {
+            ProtoErrorKind::LabelBytesTooLong(n) if *n == len => (),
+            ProtoErrorKind::LabelBytesTooLong(e) => {
+                panic!(
+                    "LabelTooLongError error don't report expected size {} of the label provided.",
+                    e
+                )
+            }
+            _ => panic!("Should have returned a LabelTooLongError"),
+        }
+    }
+
+    #[test]
+    fn test_label_too_long_ascii_with_utf8() {
+        let label_too_long = "alwaystestingcodewithatoolonglabeltoolongtofitin63bytesisagoodhabit";
+        let error = Label::from_utf8(label_too_long);
+        assert_panic_label_too_long(error, label_too_long.len());
+    }
+
+    #[test]
+    fn test_label_too_long_utf8_puny_emoji() {
+        // too long only puny 65
+        let emoji_case = "💜🦀🏖️🖥️😨🚀✨🤖💚🦾🦿😱😨✉️👺📚💻🗓️🤡🦀😈🚀💀⚡🦄";
+        let error = Label::from_utf8(emoji_case);
+        assert_panic_label_too_long(error, 64);
+    }
+
+    #[test]
+    fn test_label_too_long_utf8_puny_emoji_mixed() {
+        // too long mixed 65
+        // Something international to say
+        // "Hello I like automn coffee 🦀 interesting"
+        let emoji_case = "こんにちは-I-mögen-jesień-café-🦀-intéressant";
+        let error = Label::from_utf8(emoji_case);
+        assert_panic_label_too_long(error, 65);
+    }
+
+    #[test]
+    fn test_label_too_long_utf8_puny_mixed() {
+        // edge case 64 octet long.
+        // xn--testwithalonglabelinutf8tofitin63octetsisagoodhabit-f2106cqb
+        let edge_case = "🦀testwithalonglabelinutf8tofitin63octetsisagoodhabit🦀";
+        let error = Label::from_utf8(edge_case);
+        assert_panic_label_too_long(error, 64);
+    }
+
+    #[test]
+    fn test_label_too_long_raw() {
+        let label_too_long = b"alwaystestingcodewithatoolonglabeltoolongtofitin63bytesisagoodhabit";
+        let error = Label::from_raw_bytes(label_too_long);
+        assert_panic_label_too_long(error, label_too_long.len());
+    }
+
+    #[test]
+    fn test_label_too_long_ascii() {
+        let label_too_long = "alwaystestingcodewithatoolonglabeltoolongtofitin63bytesisagoodhabit";
+        let error = Label::from_ascii(label_too_long);
+        assert_panic_label_too_long(error, label_too_long.len());
+    }
+
     #[test]
     fn test_decoding() {
         assert_eq!(Label::from_raw_bytes(b"abc").unwrap().to_string(), "abc");
@@ -401,6 +471,12 @@ mod tests {
                 .to_string(),
             "rust-🦀-icon"
         );
+    }
+
+    #[test]
+    fn test_from_ascii_adversial_utf8() {
+        let expect_err = Label::from_ascii("🦀");
+        assert!(expect_err.is_err());
     }
 
     #[test]
@@ -470,7 +546,7 @@ mod tests {
         ];
 
         for (left, right) in comparisons {
-            println!("left: {}, right: {}", left, right);
+            println!("left: {left}, right: {right}");
             assert_eq!(left.cmp(&right), Ordering::Less);
         }
     }

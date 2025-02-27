@@ -1,34 +1,42 @@
 // Copyright 2015-2017 Benjamin Fry <benjaminfry@me.com>
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
 //! An LRU cache designed for work with DNS lookups
 
-use std::convert::TryFrom;
+use std::collections::HashMap;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use lru_cache::LruCache;
-use parking_lot::Mutex;
-
-use proto::op::Query;
-use proto::rr::Record;
+use moka::{Expiry, sync::Cache};
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Deserializer};
 
 use crate::config;
-use crate::error::*;
 use crate::lookup::Lookup;
+#[cfg(feature = "__dnssec")]
+use crate::proto::dnssec::rdata::RRSIG;
+use crate::proto::op::Query;
+#[cfg(feature = "__dnssec")]
+use crate::proto::rr::RecordData;
+use crate::proto::rr::{Record, RecordType};
+use crate::proto::{ProtoError, ProtoErrorKind};
 
-/// Maximum TTL as defined in https://tools.ietf.org/html/rfc2181, 2147483647
-///   Setting this to a value of 1 day, in seconds
+/// Maximum TTL. This is set to one day (in seconds).
+///
+/// [RFC 2181, section 8](https://tools.ietf.org/html/rfc2181#section-8) says
+/// that the maximum TTL value is 2147483647, but implementations may place an
+/// upper bound on received TTLs.
 pub(crate) const MAX_TTL: u32 = 86400_u32;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct LruValue {
-    // In the None case, this represents an NXDomain
-    lookup: Result<Lookup, ResolveError>,
+    // In the Err case, this represents an NXDomain
+    lookup: Result<Lookup, ProtoError>,
     valid_until: Instant,
 }
 
@@ -42,113 +50,221 @@ impl LruValue {
     fn ttl(&self, now: Instant) -> Duration {
         self.valid_until.saturating_duration_since(now)
     }
+
+    fn with_updated_ttl(&self, now: Instant) -> Self {
+        let lookup = match &self.lookup {
+            Ok(lookup) => {
+                let records = lookup
+                    .records()
+                    .iter()
+                    .map(|record| {
+                        let mut record = record.clone();
+                        record.set_ttl(self.ttl(now).as_secs() as u32);
+                        record
+                    })
+                    .collect::<Vec<Record>>();
+                Ok(Lookup::new_with_deadline(
+                    lookup.query().clone(),
+                    Arc::from(records),
+                    self.valid_until,
+                ))
+            }
+            Err(e) => Err(e.clone()),
+        };
+        Self {
+            lookup,
+            valid_until: self.valid_until,
+        }
+    }
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct DnsLru {
-    cache: Arc<Mutex<LruCache<Query, LruValue>>>,
-    /// A minimum TTL value for positive responses.
-    ///
-    /// Positive responses with TTLs under `positive_max_ttl` will use
-    /// `positive_max_ttl` instead.
-    ///
-    /// If this value is not set on the `TtlConfig` used to construct this
-    /// `DnsLru`, it will default to 0.
-    positive_min_ttl: Duration,
-    /// A minimum TTL value for negative (`NXDOMAIN`) responses.
-    ///
-    /// `NXDOMAIN` responses with TTLs under `negative_min_ttl` will use
-    /// `negative_min_ttl` instead.
-    ///
-    /// If this value is not set on the `TtlConfig` used to construct this
-    /// `DnsLru`, it will default to 0.
-    negative_min_ttl: Duration,
-    /// A maximum TTL value for positive responses.
-    ///
-    /// Positive responses with TTLs over `positive_max_ttl` will use
-    /// `positive_max_ttl` instead.
-    ///
-    ///  If this value is not set on the `TtlConfig` used to construct this
-    /// `DnsLru`, it will default to [`MAX_TTL`] seconds.
-    ///
-    /// [`MAX_TTL`]: const.MAX_TTL.html
-    positive_max_ttl: Duration,
-    /// A maximum TTL value for negative (`NXDOMAIN`) responses.
-    ///
-    /// `NXDOMAIN` responses with TTLs over `negative_max_ttl` will use
-    /// `negative_max_ttl` instead.
-    ///
-    ///  If this value is not set on the `TtlConfig` used to construct this
-    /// `DnsLru`, it will default to [`MAX_TTL`] seconds.
-    ///
-    /// [`MAX_TTL`]: const.MAX_TTL.html
-    negative_max_ttl: Duration,
-}
-
-/// The time-to-live, TTL, configuration for use by the cache.
+/// A cache specifically for storing DNS records.
 ///
-/// It should be understood that the TTL in DNS is expressed with a u32.
-///   We use Duration here for tracking this which can express larger values
-///   than the DNS standard. Generally a Duration greater than u32::MAX_VALUE
-///   shouldn't cause any issue as this will never be used in serialization,
-///   but understand that this would be outside the standard range.
-#[derive(Copy, Clone, Debug, Default)]
-pub(crate) struct TtlConfig {
+/// This is named `DnsLru` for historical reasons. It currently uses a "TinyLFU" policy, implemented
+/// in the `moka` library.
+#[derive(Clone, Debug)]
+pub struct DnsLru {
+    cache: Cache<Query, LruValue>,
+    ttl_config: Arc<TtlConfig>,
+}
+
+/// The time-to-live (TTL) configuration used by the cache.
+///
+/// Minimum and maximum TTLs can be set for both positive responses and negative responses. Separate
+/// limits may be set depending on the query type.
+///
+/// Note that TTLs in DNS are represented as a number of seconds stored in a 32-bit unsigned
+/// integer. We use `Duration` here, instead of `u32`, which can express larger values than the DNS
+/// standard. Generally, a `Duration` greater than `u32::MAX_VALUE` shouldn't cause any issue, as
+/// this will never be used in serialization, but note that this would be outside the standard
+/// range.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    serde(from = "ttl_config_deserialize::TtlConfigMap")
+)]
+pub struct TtlConfig {
+    /// TTL limits applied to all queries.
+    default: TtlBounds,
+
+    /// TTL limits applied to queries with specific query types.
+    by_query_type: HashMap<RecordType, TtlBounds>,
+}
+
+impl TtlConfig {
+    /// Construct the LRU's TTL configuration based on the ResolverOpts configuration.
+    pub fn from_opts(opts: &config::ResolverOpts) -> Self {
+        Self {
+            default: TtlBounds {
+                positive_min_ttl: opts.positive_min_ttl,
+                negative_min_ttl: opts.negative_min_ttl,
+                positive_max_ttl: opts.positive_max_ttl,
+                negative_max_ttl: opts.negative_max_ttl,
+            },
+            by_query_type: HashMap::new(),
+        }
+    }
+
+    /// Creates a new cache TTL configuration.
+    ///
+    /// The provided minimum and maximum TTLs will be applied to all queries unless otherwise
+    /// specified via [`Self::with_query_type_ttl_bounds`].
+    ///
+    /// If a minimum value is not provided, it will default to 0 seconds. If a maximum value is not
+    /// provided, it will default to one day.
+    pub fn new(
+        positive_min_ttl: Option<Duration>,
+        negative_min_ttl: Option<Duration>,
+        positive_max_ttl: Option<Duration>,
+        negative_max_ttl: Option<Duration>,
+    ) -> Self {
+        Self {
+            default: TtlBounds {
+                positive_min_ttl,
+                negative_min_ttl,
+                positive_max_ttl,
+                negative_max_ttl,
+            },
+            by_query_type: HashMap::new(),
+        }
+    }
+
+    /// Override the minimum and maximum TTL values for a specific query type.
+    ///
+    /// If a minimum value is not provided, it will default to 0 seconds. If a maximum value is not
+    /// provided, it will default to one day.
+    pub fn with_query_type_ttl_bounds(
+        &mut self,
+        query_type: RecordType,
+        positive_min_ttl: Option<Duration>,
+        negative_min_ttl: Option<Duration>,
+        positive_max_ttl: Option<Duration>,
+        negative_max_ttl: Option<Duration>,
+    ) -> &mut Self {
+        self.by_query_type.insert(
+            query_type,
+            TtlBounds {
+                positive_min_ttl,
+                negative_min_ttl,
+                positive_max_ttl,
+                negative_max_ttl,
+            },
+        );
+        self
+    }
+
+    /// Retrieves the minimum and maximum TTL values for positive responses.
+    pub fn positive_response_ttl_bounds(&self, query_type: RecordType) -> RangeInclusive<Duration> {
+        let bounds = self.by_query_type.get(&query_type).unwrap_or(&self.default);
+        let min = bounds
+            .positive_min_ttl
+            .unwrap_or_else(|| Duration::from_secs(0));
+        let max = bounds
+            .positive_max_ttl
+            .unwrap_or_else(|| Duration::from_secs(u64::from(MAX_TTL)));
+        min..=max
+    }
+
+    /// Retrieves the minimum and maximum TTL values for negative responses.
+    pub fn negative_response_ttl_bounds(&self, query_type: RecordType) -> RangeInclusive<Duration> {
+        let bounds = self.by_query_type.get(&query_type).unwrap_or(&self.default);
+        let min = bounds
+            .negative_min_ttl
+            .unwrap_or_else(|| Duration::from_secs(0));
+        let max = bounds
+            .negative_max_ttl
+            .unwrap_or_else(|| Duration::from_secs(u64::from(MAX_TTL)));
+        min..=max
+    }
+}
+
+/// Minimum and maximum TTL values for positive and negative responses.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
+pub struct TtlBounds {
     /// An optional minimum TTL value for positive responses.
     ///
     /// Positive responses with TTLs under `positive_min_ttl` will use
     /// `positive_min_ttl` instead.
-    pub(crate) positive_min_ttl: Option<Duration>,
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, deserialize_with = "duration_deserialize")
+    )]
+    positive_min_ttl: Option<Duration>,
+
     /// An optional minimum TTL value for negative (`NXDOMAIN`) responses.
     ///
-    /// `NXDOMAIN` responses with TTLs under `negative_min_ttl will use
+    /// `NXDOMAIN` responses with TTLs under `negative_min_ttl` will use
     /// `negative_min_ttl` instead.
-    pub(crate) negative_min_ttl: Option<Duration>,
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, deserialize_with = "duration_deserialize")
+    )]
+    negative_min_ttl: Option<Duration>,
+
     /// An optional maximum TTL value for positive responses.
     ///
-    /// Positive responses with TTLs positive `positive_max_ttl` will use
+    /// Positive responses with TTLs over `positive_max_ttl` will use
     /// `positive_max_ttl` instead.
-    pub(crate) positive_max_ttl: Option<Duration>,
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, deserialize_with = "duration_deserialize")
+    )]
+    positive_max_ttl: Option<Duration>,
+
     /// An optional maximum TTL value for negative (`NXDOMAIN`) responses.
     ///
     /// `NXDOMAIN` responses with TTLs over `negative_max_ttl` will use
     /// `negative_max_ttl` instead.
-    pub(crate) negative_max_ttl: Option<Duration>,
-}
-
-impl TtlConfig {
-    pub(crate) fn from_opts(opts: &config::ResolverOpts) -> Self {
-        Self {
-            positive_min_ttl: opts.positive_min_ttl,
-            negative_min_ttl: opts.negative_min_ttl,
-            positive_max_ttl: opts.positive_max_ttl,
-            negative_max_ttl: opts.negative_max_ttl,
-        }
-    }
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, deserialize_with = "duration_deserialize")
+    )]
+    negative_max_ttl: Option<Duration>,
 }
 
 impl DnsLru {
-    pub(crate) fn new(capacity: usize, ttl_cfg: TtlConfig) -> Self {
-        let TtlConfig {
-            positive_min_ttl,
-            negative_min_ttl,
-            positive_max_ttl,
-            negative_max_ttl,
-        } = ttl_cfg;
-        let cache = Arc::new(Mutex::new(LruCache::new(capacity)));
+    /// Construct a new cache
+    ///
+    /// # Arguments
+    ///
+    /// * `capacity` - size in number of cached queries
+    /// * `ttl_config` - minimum and maximum TTLs for cached records
+    pub fn new(capacity: usize, ttl_config: TtlConfig) -> Self {
+        let cache = Cache::builder()
+            .max_capacity(capacity.try_into().unwrap_or(u64::MAX))
+            .expire_after(LruValueExpiry)
+            .build();
         Self {
             cache,
-            positive_min_ttl: positive_min_ttl.unwrap_or_else(|| Duration::from_secs(0)),
-            negative_min_ttl: negative_min_ttl.unwrap_or_else(|| Duration::from_secs(0)),
-            positive_max_ttl: positive_max_ttl
-                .unwrap_or_else(|| Duration::from_secs(u64::from(MAX_TTL))),
-            negative_max_ttl: negative_max_ttl
-                .unwrap_or_else(|| Duration::from_secs(u64::from(MAX_TTL))),
+            ttl_config: Arc::new(ttl_config),
         }
     }
 
     pub(crate) fn clear(&self) {
-        self.cache.lock().clear();
+        self.cache.invalidate_all();
     }
 
     pub(crate) fn insert(
@@ -158,9 +274,14 @@ impl DnsLru {
         now: Instant,
     ) -> Lookup {
         let len = records_and_ttl.len();
+        let (positive_min_ttl, positive_max_ttl) = self
+            .ttl_config
+            .positive_response_ttl_bounds(query.query_type())
+            .into_inner();
+
         // collapse the values, we're going to take the Minimum TTL as the correct one
         let (records, ttl): (Vec<Record>, Duration) = records_and_ttl.into_iter().fold(
-            (Vec::with_capacity(len), self.positive_max_ttl),
+            (Vec::with_capacity(len), positive_max_ttl),
             |(mut records, mut min_ttl), (record, ttl)| {
                 records.push(record);
                 let ttl = Duration::from_secs(u64::from(ttl));
@@ -171,18 +292,104 @@ impl DnsLru {
 
         // If the cache was configured with a minimum TTL, and that value is higher
         // than the minimum TTL in the values, use it instead.
-        let ttl = self.positive_min_ttl.max(ttl);
+        let ttl = positive_min_ttl.max(ttl);
         let valid_until = now + ttl;
 
         // insert into the LRU
         let lookup = Lookup::new_with_deadline(query.clone(), Arc::from(records), valid_until);
-        self.cache.lock().insert(
+        self.cache.insert(
             query,
             LruValue {
                 lookup: Ok(lookup.clone()),
                 valid_until,
             },
         );
+
+        lookup
+    }
+
+    /// inserts a record based on the name and type.
+    ///
+    /// # Arguments
+    ///
+    /// * `original_query` - is used for matching the records that should be returned
+    /// * `records` - the records will be partitioned by type and name for storage in the cache
+    /// * `now` - current time for use in associating TTLs
+    ///
+    /// # Return
+    ///
+    /// This should always return some records, but will be None if there are no records or the original_query matches none
+    pub fn insert_records(
+        &self,
+        original_query: Query,
+        records: impl Iterator<Item = Record>,
+        now: Instant,
+    ) -> Option<Lookup> {
+        // collect all records by name
+        let records = records.fold(
+            HashMap::<Query, Vec<(Record, u32)>>::new(),
+            |mut map, record| {
+                // it's not useful to cache RRSIGs on their own using `name()` as a key because
+                // there can be multiple RRSIG associated to the same domain name where each
+                // RRSIG is *covering* a different record type
+                //
+                // an example of this is shown below
+                //
+                // ``` console
+                // $ dig @a.iana-servers.net. +norecurse +dnssec A example.com.
+                // example.com.     3600    IN  A   93.184.215.14
+                // example.com.     3600    IN  RRSIG   A 13 2 3600 20240705065834 (..)
+                //
+                // $ dig @a.iana-servers.net. +norecurse +dnssec A example.com.
+                // example.com.     86400   IN  NS  a.iana-servers.net.
+                // example.com.     86400   IN  NS  b.iana-servers.net.
+                // example.com.     86400   IN  RRSIG   NS 13 2 86400 20240705060635 (..)
+                // ```
+                //
+                // note that there are two RRSIG records associated to `example.com.` but they are
+                // covering different record types. the first RRSIG covers the
+                // `A example.com.` record. the second RRSIG covers two `NS example.com.` records
+                //
+                // if we use ("example.com.", RecordType::RRSIG) as a key in our cache these two
+                // consecutive queries will cause the entry to be overwritten, losing the RRSIG
+                // covering the A record
+                //
+                // to avoid this problem, we'll cache the RRSIG along the record it covers using
+                // the record's type along the record's `name()` as the key in the cache
+                //
+                // For CNAME records, we want to preserve the original request query type, since
+                // that's what would be used to retrieve the cached query.
+                let rtype = match record.record_type() {
+                    RecordType::CNAME => original_query.query_type(),
+                    #[cfg(feature = "__dnssec")]
+                    RecordType::RRSIG => match RRSIG::try_borrow(record.data()) {
+                        Some(rrsig) => rrsig.type_covered(),
+                        None => record.record_type(),
+                    },
+                    _ => record.record_type(),
+                };
+
+                let mut query = Query::query(record.name().clone(), rtype);
+                query.set_query_class(record.dns_class());
+
+                let ttl = record.ttl();
+
+                map.entry(query).or_default().push((record, ttl));
+
+                map
+            },
+        );
+
+        // now insert by record type and name
+        let mut lookup = None;
+        for (query, records_and_ttl) in records {
+            let is_query = original_query == query;
+            let inserted = self.insert(query, records_and_ttl, now);
+
+            if is_query {
+                lookup = Some(inserted)
+            }
+        }
 
         lookup
     }
@@ -192,7 +399,7 @@ impl DnsLru {
         let ttl = Duration::from_secs(u64::from(ttl));
         let valid_until = now + ttl;
 
-        self.cache.lock().insert(
+        self.cache.insert(
             query,
             LruValue {
                 lookup: Ok(lookup.clone()),
@@ -203,49 +410,41 @@ impl DnsLru {
         lookup
     }
 
-    /// This converts the ResolveError to set the inner negative_ttl value to be the
+    /// This converts the Error to set the inner negative_ttl value to be the
     ///  current expiration ttl.
-    fn nx_error_with_ttl(error: &mut ResolveError, new_ttl: Duration) {
-        if let ResolveError {
-            kind:
-                ResolveErrorKind::NoRecordsFound {
-                    ref mut negative_ttl,
-                    ..
-                },
-            ..
-        } = error
-        {
+    fn nx_error_with_ttl(error: &mut ProtoError, new_ttl: Duration) {
+        let ProtoError { kind, .. } = error;
+
+        if let ProtoErrorKind::NoRecordsFound { negative_ttl, .. } = kind.as_mut() {
             *negative_ttl = Some(u32::try_from(new_ttl.as_secs()).unwrap_or(MAX_TTL));
         }
     }
 
-    pub(crate) fn negative(
-        &self,
-        query: Query,
-        mut error: ResolveError,
-        now: Instant,
-    ) -> ResolveError {
+    pub(crate) fn negative(&self, query: Query, mut error: ProtoError, now: Instant) -> ProtoError {
+        let ProtoError { kind, .. } = &error;
+
         // TODO: if we are getting a negative response, should we instead fallback to cache?
         //   this would cache indefinitely, probably not correct
-        if let ResolveError {
-            kind:
-                ResolveErrorKind::NoRecordsFound {
-                    negative_ttl: Some(ttl),
-                    ..
-                },
+        if let ProtoErrorKind::NoRecordsFound {
+            negative_ttl: Some(ttl),
             ..
-        } = error
+        } = kind.as_ref()
         {
-            let ttl_duration = Duration::from_secs(u64::from(ttl))
+            let (negative_min_ttl, negative_max_ttl) = self
+                .ttl_config
+                .negative_response_ttl_bounds(query.query_type())
+                .into_inner();
+
+            let ttl_duration = Duration::from_secs(u64::from(*ttl))
                 // Clamp the TTL so that it's between the cache's configured
                 // minimum and maximum TTLs for negative responses.
-                .clamp(self.negative_min_ttl, self.negative_max_ttl);
+                .clamp(negative_min_ttl, negative_max_ttl);
             let valid_until = now + ttl_duration;
 
             {
                 let error = error.clone();
 
-                self.cache.lock().insert(
+                self.cache.insert(
                     query,
                     LruValue {
                         lookup: Err(error),
@@ -260,45 +459,70 @@ impl DnsLru {
         error
     }
 
-    /// This needs to be mut b/c it's an LRU, meaning the ordering of elements will potentially change on retrieval...
-    pub(crate) fn get(&self, query: &Query, now: Instant) -> Option<Result<Lookup, ResolveError>> {
-        let mut out_of_date = false;
-        let mut cache = self.cache.lock();
-        let lookup = cache.get_mut(query).and_then(|value| {
-            if value.is_current(now) {
-                out_of_date = false;
-                let mut result = value.lookup.clone();
-
-                if let Err(ref mut err) = result {
-                    Self::nx_error_with_ttl(err, value.ttl(now));
-                }
-                Some(result)
-            } else {
-                out_of_date = true;
-                None
-            }
-        });
-
-        // in this case, we can preemptively remove out of data elements
-        // this assumes time is always moving forward, this would only not be true in contrived situations where now
-        //  is not current time, like tests...
-        if out_of_date {
-            cache.remove(query);
+    /// Based on the query, see if there are any records available
+    pub fn get(&self, query: &Query, now: Instant) -> Option<Result<Lookup, ProtoError>> {
+        let value = self.cache.get(query)?;
+        if !value.is_current(now) {
+            return None;
         }
+        let mut result = value.with_updated_ttl(now).lookup;
+        if let Err(err) = &mut result {
+            Self::nx_error_with_ttl(err, value.ttl(now));
+        }
+        Some(result)
+    }
+}
 
-        lookup
+/// This is an alternate deserialization function for an optional [`Duration`] that expects a single
+/// number, representing the number of seconds, instead of a struct with `secs` and `nanos` fields.
+#[cfg(feature = "serde")]
+fn duration_deserialize<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(
+        Option::<u32>::deserialize(deserializer)?
+            .map(|seconds| Duration::from_secs(seconds.into())),
+    )
+}
+
+#[cfg(feature = "serde")]
+mod ttl_config_deserialize;
+
+struct LruValueExpiry;
+
+impl Expiry<Query, LruValue> for LruValueExpiry {
+    fn expire_after_create(
+        &self,
+        _key: &Query,
+        value: &LruValue,
+        created_at: Instant,
+    ) -> Option<Duration> {
+        Some(value.ttl(created_at))
+    }
+
+    fn expire_after_update(
+        &self,
+        _key: &Query,
+        value: &LruValue,
+        updated_at: Instant,
+        _duration_until_expiry: Option<Duration>,
+    ) -> Option<Duration> {
+        Some(value.ttl(updated_at))
     }
 }
 
 // see also the lookup_tests.rs in integration-tests crate
 #[cfg(test)]
 mod tests {
-    use std::net::*;
     use std::str::FromStr;
     use std::time::*;
 
-    use proto::op::{Query, ResponseCode};
-    use proto::rr::{Name, RData, RecordType};
+    use hickory_proto::rr::rdata::TXT;
+
+    use crate::proto::op::{Query, ResponseCode};
+    use crate::proto::rr::rdata::A;
+    use crate::proto::rr::{Name, RData, RecordType};
 
     use super::*;
 
@@ -310,7 +534,7 @@ mod tests {
         let past_the_future = now + Duration::from_secs(6);
 
         let value = LruValue {
-            lookup: Err(ResolveErrorKind::Message("test error").into()),
+            lookup: Err(ProtoErrorKind::Message("test error").into()),
             valid_until: future,
         };
 
@@ -328,14 +552,17 @@ mod tests {
         let query = Query::query(name.clone(), RecordType::A);
         // record should have TTL of 1 second.
         let ips_ttl = vec![(
-            Record::from_rdata(name.clone(), 1, RData::A(Ipv4Addr::new(127, 0, 0, 1))),
+            Record::from_rdata(name.clone(), 1, RData::A(A::new(127, 0, 0, 1))),
             1,
         )];
-        let ips = vec![RData::A(Ipv4Addr::new(127, 0, 0, 1))];
+        let ips = [RData::A(A::new(127, 0, 0, 1))];
 
         // configure the cache with a minimum TTL of 2 seconds.
         let ttls = TtlConfig {
-            positive_min_ttl: Some(Duration::from_secs(2)),
+            default: TtlBounds {
+                positive_min_ttl: Some(Duration::from_secs(2)),
+                ..TtlBounds::default()
+            },
             ..TtlConfig::default()
         };
         let lru = DnsLru::new(1, ttls);
@@ -348,7 +575,7 @@ mod tests {
 
         // record should have TTL of 3 seconds.
         let ips_ttl = vec![(
-            Record::from_rdata(name, 3, RData::A(Ipv4Addr::new(127, 0, 0, 1))),
+            Record::from_rdata(name, 3, RData::A(A::new(127, 0, 0, 1))),
             3,
         )];
 
@@ -367,46 +594,53 @@ mod tests {
 
         // configure the cache with a maximum TTL of 2 seconds.
         let ttls = TtlConfig {
-            negative_min_ttl: Some(Duration::from_secs(2)),
+            default: TtlBounds {
+                negative_min_ttl: Some(Duration::from_secs(2)),
+                ..TtlBounds::default()
+            },
             ..TtlConfig::default()
         };
         let lru = DnsLru::new(1, ttls);
 
         // neg response should have TTL of 1 seconds.
-        let err = ResolveErrorKind::NoRecordsFound {
+        let err = ProtoErrorKind::NoRecordsFound {
             query: Box::new(name.clone()),
             soa: None,
+            ns: None,
             negative_ttl: Some(1),
             response_code: ResponseCode::NoError,
             trusted: false,
+            authorities: None,
         };
         let nx_error = lru.negative(name.clone(), err.into(), now);
         match nx_error.kind() {
-            &ResolveErrorKind::NoRecordsFound { negative_ttl, .. } => {
+            &ProtoErrorKind::NoRecordsFound { negative_ttl, .. } => {
                 let valid_until = negative_ttl.expect("resolve error should have a deadline");
                 // the error's `valid_until` field should have been limited to 2 seconds.
                 assert_eq!(valid_until, 2);
             }
-            other => panic!("expected ResolveErrorKind::NoRecordsFound, got {:?}", other),
+            other => panic!("expected ProtoErrorKind::NoRecordsFound, got {:?}", other),
         }
 
         // neg response should have TTL of 3 seconds.
-        let err = ResolveErrorKind::NoRecordsFound {
+        let err = ProtoErrorKind::NoRecordsFound {
             query: Box::new(name.clone()),
             soa: None,
+            ns: None,
             negative_ttl: Some(3),
             response_code: ResponseCode::NoError,
             trusted: false,
+            authorities: None,
         };
         let nx_error = lru.negative(name, err.into(), now);
         match nx_error.kind() {
-            &ResolveErrorKind::NoRecordsFound { negative_ttl, .. } => {
-                let negative_ttl = negative_ttl.expect("ResolveError should have a deadline");
+            &ProtoErrorKind::NoRecordsFound { negative_ttl, .. } => {
+                let negative_ttl = negative_ttl.expect("ProtoError should have a deadline");
                 // the error's `valid_until` field should not have been limited, as it was
                 // over the min TTL.
                 assert_eq!(negative_ttl, 3);
             }
-            other => panic!("expected ResolveErrorKind::NoRecordsFound, got {:?}", other),
+            other => panic!("expected ProtoErrorKind::NoRecordsFound, got {:?}", other),
         }
     }
 
@@ -418,14 +652,17 @@ mod tests {
         let query = Query::query(name.clone(), RecordType::A);
         // record should have TTL of 62 seconds.
         let ips_ttl = vec![(
-            Record::from_rdata(name.clone(), 62, RData::A(Ipv4Addr::new(127, 0, 0, 1))),
+            Record::from_rdata(name.clone(), 62, RData::A(A::new(127, 0, 0, 1))),
             62,
         )];
-        let ips = vec![RData::A(Ipv4Addr::new(127, 0, 0, 1))];
+        let ips = [RData::A(A::new(127, 0, 0, 1))];
 
         // configure the cache with a maximum TTL of 60 seconds.
         let ttls = TtlConfig {
-            positive_max_ttl: Some(Duration::from_secs(60)),
+            default: TtlBounds {
+                positive_max_ttl: Some(Duration::from_secs(60)),
+                ..TtlBounds::default()
+            },
             ..TtlConfig::default()
         };
         let lru = DnsLru::new(1, ttls);
@@ -438,7 +675,7 @@ mod tests {
 
         // record should have TTL of 59 seconds.
         let ips_ttl = vec![(
-            Record::from_rdata(name, 59, RData::A(Ipv4Addr::new(127, 0, 0, 1))),
+            Record::from_rdata(name, 59, RData::A(A::new(127, 0, 0, 1))),
             59,
         )];
 
@@ -457,46 +694,53 @@ mod tests {
 
         // configure the cache with a maximum TTL of 60 seconds.
         let ttls = TtlConfig {
-            negative_max_ttl: Some(Duration::from_secs(60)),
+            default: TtlBounds {
+                negative_max_ttl: Some(Duration::from_secs(60)),
+                ..TtlBounds::default()
+            },
             ..TtlConfig::default()
         };
         let lru = DnsLru::new(1, ttls);
 
         // neg response should have TTL of 62 seconds.
-        let err = ResolveErrorKind::NoRecordsFound {
+        let err: ProtoErrorKind = ProtoErrorKind::NoRecordsFound {
             query: Box::new(name.clone()),
             soa: None,
+            ns: None,
             negative_ttl: Some(62),
             response_code: ResponseCode::NoError,
             trusted: false,
+            authorities: None,
         };
         let nx_error = lru.negative(name.clone(), err.into(), now);
         match nx_error.kind() {
-            &ResolveErrorKind::NoRecordsFound { negative_ttl, .. } => {
+            &ProtoErrorKind::NoRecordsFound { negative_ttl, .. } => {
                 let negative_ttl = negative_ttl.expect("resolve error should have a deadline");
                 // the error's `valid_until` field should have been limited to 60 seconds.
                 assert_eq!(negative_ttl, 60);
             }
-            other => panic!("expected ResolveErrorKind::NoRecordsFound, got {:?}", other),
+            other => panic!("expected ProtoErrorKind::NoRecordsFound, got {:?}", other),
         }
 
         // neg response should have TTL of 59 seconds.
-        let err = ResolveErrorKind::NoRecordsFound {
+        let err = ProtoErrorKind::NoRecordsFound {
             query: Box::new(name.clone()),
             soa: None,
+            ns: None,
             negative_ttl: Some(59),
             response_code: ResponseCode::NoError,
             trusted: false,
+            authorities: None,
         };
         let nx_error = lru.negative(name, err.into(), now);
         match nx_error.kind() {
-            &ResolveErrorKind::NoRecordsFound { negative_ttl, .. } => {
+            &ProtoErrorKind::NoRecordsFound { negative_ttl, .. } => {
                 let negative_ttl = negative_ttl.expect("resolve error should have a deadline");
                 // the error's `valid_until` field should not have been limited, as it was
                 // under the max TTL.
                 assert_eq!(negative_ttl, 59);
             }
-            other => panic!("expected ResolveErrorKind::NoRecordsFound, got {:?}", other),
+            other => panic!("expected ProtoErrorKind::NoRecordsFound, got {:?}", other),
         }
     }
 
@@ -507,10 +751,10 @@ mod tests {
         let name = Name::from_str("www.example.com.").unwrap();
         let query = Query::query(name.clone(), RecordType::A);
         let ips_ttl = vec![(
-            Record::from_rdata(name, 1, RData::A(Ipv4Addr::new(127, 0, 0, 1))),
+            Record::from_rdata(name, 1, RData::A(A::new(127, 0, 0, 1))),
             1,
         )];
-        let ips = vec![RData::A(Ipv4Addr::new(127, 0, 0, 1))];
+        let ips = [RData::A(A::new(127, 0, 0, 1))];
         let lru = DnsLru::new(1, TtlConfig::default());
 
         let rc_ips = lru.insert(query.clone(), ips_ttl, now);
@@ -521,6 +765,33 @@ mod tests {
     }
 
     #[test]
+    fn test_update_ttl() {
+        let now = Instant::now();
+
+        let name = Name::from_str("www.example.com.").unwrap();
+        let query = Query::query(name.clone(), RecordType::A);
+        let ips_ttl = vec![(
+            Record::from_rdata(name, 10, RData::A(A::new(127, 0, 0, 1))),
+            10,
+        )];
+        let ips = [RData::A(A::new(127, 0, 0, 1))];
+        let lru = DnsLru::new(1, TtlConfig::default());
+
+        let rc_ips = lru.insert(query.clone(), ips_ttl, now);
+        assert_eq!(*rc_ips.iter().next().unwrap(), ips[0]);
+
+        let ttl = lru
+            .get(&query, now + Duration::from_secs(2))
+            .unwrap()
+            .expect("records should exist")
+            .record_iter()
+            .next()
+            .unwrap()
+            .ttl();
+        assert!(ttl <= 8);
+    }
+
+    #[test]
     fn test_insert_ttl() {
         let now = Instant::now();
         let name = Name::from_str("www.example.com.").unwrap();
@@ -528,17 +799,17 @@ mod tests {
         // TTL should be 1
         let ips_ttl = vec![
             (
-                Record::from_rdata(name.clone(), 1, RData::A(Ipv4Addr::new(127, 0, 0, 1))),
+                Record::from_rdata(name.clone(), 1, RData::A(A::new(127, 0, 0, 1))),
                 1,
             ),
             (
-                Record::from_rdata(name, 2, RData::A(Ipv4Addr::new(127, 0, 0, 2))),
+                Record::from_rdata(name, 2, RData::A(A::new(127, 0, 0, 2))),
                 2,
             ),
         ];
         let ips = vec![
-            RData::A(Ipv4Addr::new(127, 0, 0, 1)),
-            RData::A(Ipv4Addr::new(127, 0, 0, 2)),
+            RData::A(A::new(127, 0, 0, 1)),
+            RData::A(A::new(127, 0, 0, 2)),
         ];
         let lru = DnsLru::new(1, TtlConfig::default());
 
@@ -564,23 +835,26 @@ mod tests {
         // TTL should be 1
         let ips_ttl = vec![
             (
-                Record::from_rdata(name.clone(), 1, RData::A(Ipv4Addr::new(127, 0, 0, 1))),
+                Record::from_rdata(name.clone(), 1, RData::A(A::new(127, 0, 0, 1))),
                 1,
             ),
             (
-                Record::from_rdata(name, 2, RData::A(Ipv4Addr::new(127, 0, 0, 2))),
+                Record::from_rdata(name, 2, RData::A(A::new(127, 0, 0, 2))),
                 2,
             ),
         ];
         let ips = vec![
-            RData::A(Ipv4Addr::new(127, 0, 0, 1)),
-            RData::A(Ipv4Addr::new(127, 0, 0, 2)),
+            RData::A(A::new(127, 0, 0, 1)),
+            RData::A(A::new(127, 0, 0, 2)),
         ];
 
         // this cache should override the TTL of 1 seconds with the configured
         // minimum TTL of 3 seconds.
         let ttls = TtlConfig {
-            positive_min_ttl: Some(Duration::from_secs(3)),
+            default: TtlBounds {
+                positive_min_ttl: Some(Duration::from_secs(3)),
+                ..TtlBounds::default()
+            },
             ..TtlConfig::default()
         };
         let lru = DnsLru::new(1, ttls);
@@ -624,23 +898,26 @@ mod tests {
         // TTL should be 500
         let ips_ttl = vec![
             (
-                Record::from_rdata(name.clone(), 400, RData::A(Ipv4Addr::new(127, 0, 0, 1))),
+                Record::from_rdata(name.clone(), 400, RData::A(A::new(127, 0, 0, 1))),
                 400,
             ),
             (
-                Record::from_rdata(name, 500, RData::A(Ipv4Addr::new(127, 0, 0, 2))),
+                Record::from_rdata(name, 500, RData::A(A::new(127, 0, 0, 2))),
                 500,
             ),
         ];
         let ips = vec![
-            RData::A(Ipv4Addr::new(127, 0, 0, 1)),
-            RData::A(Ipv4Addr::new(127, 0, 0, 2)),
+            RData::A(A::new(127, 0, 0, 1)),
+            RData::A(A::new(127, 0, 0, 2)),
         ];
 
         // this cache should override the TTL of 500 seconds with the configured
         // minimum TTL of 2 seconds.
         let ttls = TtlConfig {
-            positive_max_ttl: Some(Duration::from_secs(2)),
+            default: TtlBounds {
+                positive_max_ttl: Some(Duration::from_secs(2)),
+                ..TtlBounds::default()
+            },
             ..TtlConfig::default()
         };
         let lru = DnsLru::new(1, ttls);
@@ -666,5 +943,58 @@ mod tests {
         // after 3 seconds, the records should be invalid.
         let rc_ips = lru.get(&query, now + Duration::from_secs(3));
         assert!(rc_ips.is_none());
+    }
+
+    #[test]
+    fn test_lookup_positive_min_ttl_different_query_types() {
+        let now = Instant::now();
+
+        let name = Name::from_str("www.example.com.").unwrap();
+        let query_a = Query::query(name.clone(), RecordType::A);
+        let query_txt = Query::query(name.clone(), RecordType::TXT);
+        let rdata_a = RData::A(A::new(127, 0, 0, 1));
+        let rdata_txt = RData::TXT(TXT::new(vec!["data".to_string()]));
+        // store records with a TTL of 1 second.
+        let records_ttl_a = vec![(Record::from_rdata(name.clone(), 1, rdata_a.clone()), 1)];
+        let records_ttl_txt = vec![(Record::from_rdata(name.clone(), 1, rdata_txt.clone()), 1)];
+
+        // set separate positive_min_ttl limits for TXT queries and all others
+        let mut ttl_config = TtlConfig::new(Some(Duration::from_secs(2)), None, None, None);
+        ttl_config.with_query_type_ttl_bounds(
+            RecordType::TXT,
+            Some(Duration::from_secs(5)),
+            None,
+            None,
+            None,
+        );
+        let lru = DnsLru::new(2, ttl_config);
+
+        let rc_a = lru.insert(query_a.clone(), records_ttl_a, now);
+        assert_eq!(*rc_a.iter().next().unwrap(), rdata_a);
+        // the returned lookup should use the cache's default min TTL, since the
+        // response's TTL was below the minimum.
+        assert_eq!(rc_a.valid_until(), now + Duration::from_secs(2));
+
+        let rc_txt = lru.insert(query_txt.clone(), records_ttl_txt, now);
+        assert_eq!(*rc_txt.iter().next().unwrap(), rdata_txt);
+        // the returned lookup should use the min TTL for TXT records, since the
+        // response's TTL was below the minimum.
+        assert_eq!(rc_txt.valid_until(), now + Duration::from_secs(5));
+
+        // store records with a TTL of 7 seconds.
+        let records_ttl_a = vec![(Record::from_rdata(name.clone(), 1, rdata_a.clone()), 7)];
+        let records_ttl_txt = vec![(Record::from_rdata(name.clone(), 1, rdata_txt.clone()), 7)];
+
+        let rc_a = lru.insert(query_a, records_ttl_a, now);
+        assert_eq!(*rc_a.iter().next().unwrap(), rdata_a);
+        // the returned lookup should use the record's TTL, since it's
+        // greater than the default min TTL.
+        assert_eq!(rc_a.valid_until(), now + Duration::from_secs(7));
+
+        let rc_txt = lru.insert(query_txt, records_ttl_txt, now);
+        assert_eq!(*rc_txt.iter().next().unwrap(), rdata_txt);
+        // the returned lookup should use the record's TTL, since it's
+        // greater than the min TTL for TXT records.
+        assert_eq!(rc_txt.valid_until(), now + Duration::from_secs(7));
     }
 }

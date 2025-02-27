@@ -1,115 +1,148 @@
-// Copyright (C) 2015 - 2016 Benjamin Fry <benjaminfry@me.com>
+// Copyright 2015-2023 Benjamin Fry <benjaminfry@me.com>
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
+// copied, modified, or distributed except according to those terms.
 
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-
-use futures_util::stream::{Stream, StreamExt};
-use tokio::runtime::{self, Runtime};
-use trust_dns_proto::xfer::DnsRequest;
-
-use crate::client::async_client::ClientStreamXfr;
-use crate::client::{AsyncClient, ClientConnection, ClientHandle, Signer};
-use crate::error::*;
-use crate::proto::{
-    error::ProtoError,
-    xfer::{DnsExchangeSend, DnsHandle, DnsResponse},
-};
-use crate::rr::rdata::SOA;
-use crate::rr::{DNSClass, Name, Record, RecordSet, RecordType};
-#[cfg(feature = "dnssec")]
-use {
-    crate::client::AsyncDnssecClient,
-    crate::rr::dnssec::{tsig::TSigner, SigSigner, TrustAnchor},
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
 };
 
-use super::ClientStreamingResponse;
+use futures_util::{
+    ready,
+    stream::{Stream, StreamExt},
+};
+use rand;
+use tracing::debug;
 
-#[allow(clippy::type_complexity)]
-pub(crate) type NewFutureObj<H> = Pin<
-    Box<
-        dyn Future<
-                Output = Result<
-                    (
-                        H,
-                        Box<dyn Future<Output = Result<(), ProtoError>> + 'static + Send + Unpin>,
-                    ),
-                    ProtoError,
-                >,
-            >
-            + 'static
-            + Send,
-    >,
->;
+use crate::{ClientError, ClientErrorKind};
+use hickory_proto::{
+    ProtoError, ProtoErrorKind,
+    op::{Edns, Message, MessageFinalizer, MessageType, OpCode, Query, update_message},
+    rr::{DNSClass, Name, Record, RecordSet, RecordType, rdata::SOA},
+    runtime::TokioTime,
+    xfer::{
+        BufDnsStreamHandle, DnsClientStream, DnsExchange, DnsExchangeBackground, DnsExchangeSend,
+        DnsHandle, DnsMultiplexer, DnsRequest, DnsRequestOptions, DnsRequestSender, DnsResponse,
+    },
+};
 
-/// Client trait which implements basic DNS Client operations.
-///
-/// As of 0.10.0, the Client is now a wrapper around the `AsyncClient`, which is a futures-rs
-/// and tokio-rs based implementation. This trait implements synchronous functions for ease of use.
-///
-/// There was a strong attempt to make it backwards compatible, but making it a drop in replacement
-/// for the old Client was not possible. This trait has two implementations, the `SyncClient` which
-/// is a standard DNS Client, and the `SyncDnssecClient` which is a wrapper on `DnssecDnsHandle`
-/// providing DNSSec validation.
-///
-/// *note* When upgrading from previous usage, both `SyncClient` and `SyncDnssecClient` have an
-/// signer which can be optionally associated to the Client. This replaces the previous per-function
-/// parameter, and it will sign all update requests (this matches the `AsyncClient` API).
-#[allow(unreachable_code)]
-pub trait Client {
-    /// The result stream that will resolve into a DnsResponse
-    type Response: Stream<Item = Result<DnsResponse, ProtoError>> + 'static + Send + Unpin;
-    /// The AsyncClient type used
-    type Handle: DnsHandle<Response = Self::Response, Error = ProtoError> + 'static + Send + Unpin;
+#[doc(hidden)]
+#[deprecated(since = "0.25.0", note = "use `Client` instead")]
+pub type ClientFuture = Client;
 
-    /// Return the inner Futures items
+/// A DNS Client implemented over futures-rs.
+///
+/// This Client is generic and capable of wrapping UDP, TCP, and other underlying DNS protocol
+///  implementations.
+#[derive(Clone)]
+pub struct Client {
+    exchange: DnsExchange,
+    use_edns: bool,
+}
+
+impl Client {
+    /// Spawns a new Client Stream. This uses a default timeout of 5 seconds for all requests.
     ///
-    /// Consumes the connection and allows for future based operations afterward.
-    fn new_future(&self) -> NewFutureObj<Self::Handle>;
-
-    /// This will create a new AsyncClient and spawn it into a new Runtime
-    fn spawn_client(&self) -> ClientResult<(Self::Handle, Runtime)> {
-        let mut builder = runtime::Builder::new_current_thread();
-        builder.enable_all();
-
-        let reactor = builder.build()?;
-        let client = self.new_future();
-
-        let (client, bg) = reactor.block_on(client)?;
-
-        // TODO: should we return this?
-        let _join_bg = reactor.spawn(bg);
-
-        Ok((client, reactor))
+    /// # Arguments
+    ///
+    /// * `stream` - A stream of bytes that can be used to send/receive DNS messages
+    ///              (see TcpClientStream or UdpClientStream)
+    /// * `stream_handle` - The handle for the `stream` on which bytes can be sent/received.
+    /// * `signer` - An optional signer for requests, needed for Updates with Sig0, otherwise not needed
+    #[allow(clippy::new_ret_no_self)]
+    pub async fn new<F, S>(
+        stream: F,
+        stream_handle: BufDnsStreamHandle,
+        signer: Option<Arc<dyn MessageFinalizer>>,
+    ) -> Result<(Self, DnsExchangeBackground<DnsMultiplexer<S>, TokioTime>), ProtoError>
+    where
+        F: Future<Output = Result<S, ProtoError>> + Send + Unpin + 'static,
+        S: DnsClientStream + 'static + Unpin,
+    {
+        Self::with_timeout(stream, stream_handle, Duration::from_secs(5), signer).await
     }
 
-    /// Sends an arbitrary `DnsRequest` to the client
-    fn send<R: Into<DnsRequest> + Unpin + Send + 'static>(
-        &self,
-        msg: R,
-    ) -> Vec<ClientResult<DnsResponse>> {
-        let (mut client, runtime) = match self.spawn_client() {
-            Ok(c_r) => c_r,
-            Err(e) => return vec![Err(e)],
-        };
-        runtime.block_on(ClientStreamingResponse(client.send(msg)).collect::<Vec<_>>())
+    /// Spawns a new Client Stream.
+    ///
+    /// # Arguments
+    ///
+    /// * `stream` - A stream of bytes that can be used to send/receive DNS messages
+    ///              (see TcpClientStream or UdpClientStream)
+    /// * `timeout_duration` - All requests may fail due to lack of response, this is the time to
+    ///                        wait for a response before canceling the request.
+    /// * `stream_handle` - The handle for the `stream` on which bytes can be sent/received.
+    /// * `signer` - An optional signer for requests, needed for Updates with Sig0, otherwise not needed
+    pub async fn with_timeout<F, S>(
+        stream: F,
+        stream_handle: BufDnsStreamHandle,
+        timeout_duration: Duration,
+        signer: Option<Arc<dyn MessageFinalizer>>,
+    ) -> Result<(Self, DnsExchangeBackground<DnsMultiplexer<S>, TokioTime>), ProtoError>
+    where
+        F: Future<Output = Result<S, ProtoError>> + 'static + Send + Unpin,
+        S: DnsClientStream + 'static + Unpin,
+    {
+        let mp = DnsMultiplexer::with_timeout(stream, stream_handle, timeout_duration, signer);
+        Self::connect(mp).await
     }
 
-    /// A *classic* DNS query, i.e. does not perform any DNSSec operations
+    /// Returns a future, which itself wraps a future which is awaiting connection.
     ///
-    /// *Note* As of now, this will not recurse on PTR record responses, that is up to
+    /// The connect_future should be lazy.
+    ///
+    /// # Returns
+    ///
+    /// This returns a tuple of Self a handle to send dns messages and an optional background.
+    ///  The background task must be run on an executor before handle is used, if it is Some.
+    ///  If it is None, then another thread has already run the background.
+    pub async fn connect<F, S>(
+        connect_future: F,
+    ) -> Result<(Self, DnsExchangeBackground<S, TokioTime>), ProtoError>
+    where
+        S: DnsRequestSender,
+        F: Future<Output = Result<S, ProtoError>> + 'static + Send + Unpin,
+    {
+        let result = DnsExchange::connect(connect_future).await;
+        let use_edns = true;
+        result.map(|(exchange, bg)| (Self { exchange, use_edns }, bg))
+    }
+
+    /// (Re-)enable usage of EDNS for outgoing messages
+    pub fn enable_edns(&mut self) {
+        self.use_edns = true;
+    }
+
+    /// Disable usage of EDNS for outgoing messages
+    pub fn disable_edns(&mut self) {
+        self.use_edns = false;
+    }
+}
+
+impl DnsHandle for Client {
+    type Response = DnsExchangeSend;
+
+    fn send<R: Into<DnsRequest> + Unpin + Send + 'static>(&self, request: R) -> Self::Response {
+        self.exchange.send(request)
+    }
+
+    fn is_using_edns(&self) -> bool {
+        self.use_edns
+    }
+}
+
+impl<T> ClientHandle for T where T: DnsHandle {}
+
+/// A trait for implementing high level functions of DNS.
+pub trait ClientHandle: 'static + Clone + DnsHandle + Send {
+    /// A *classic* DNS query
+    ///
+    /// *Note* As of now, this will not recurse on PTR or CNAME record responses, that is up to
     ///        the caller.
     ///
     /// # Arguments
@@ -118,17 +151,71 @@ pub trait Client {
     /// * `query_class` - most likely this should always be DNSClass::IN
     /// * `query_type` - record type to lookup
     fn query(
-        &self,
-        name: &Name,
+        &mut self,
+        name: Name,
         query_class: DNSClass,
         query_type: RecordType,
-    ) -> ClientResult<DnsResponse> {
-        let (mut client, runtime) = self.spawn_client()?;
-
-        runtime.block_on(client.query(name.clone(), query_class, query_type))
+    ) -> ClientResponse<<Self as DnsHandle>::Response> {
+        let mut query = Query::query(name, query_type);
+        query.set_query_class(query_class);
+        let mut options = DnsRequestOptions::default();
+        options.use_edns = self.is_using_edns();
+        ClientResponse(self.lookup(query, options))
     }
 
     /// Sends a NOTIFY message to the remote system
+    ///
+    /// [RFC 1996](https://tools.ietf.org/html/rfc1996), DNS NOTIFY, August 1996
+    ///
+    ///
+    /// ```text
+    /// 1. Rationale and Scope
+    ///
+    ///   1.1. Slow propagation of new and changed data in a DNS zone can be
+    ///   due to a zone's relatively long refresh times.  Longer refresh times
+    ///   are beneficial in that they reduce load on the Primary Zone Servers, but
+    ///   that benefit comes at the cost of long intervals of incoherence among
+    ///   authority servers whenever the zone is updated.
+    ///
+    ///   1.2. The DNS NOTIFY transaction allows Primary Zone Servers to inform Secondary
+    ///   Zone Servers when the zone has changed -- an interrupt as opposed to poll
+    ///   model -- which it is hoped will reduce propagation delay while not
+    ///   unduly increasing the masters' load.  This specification only allows
+    ///   slaves to be notified of SOA RR changes, but the architecture of
+    ///   NOTIFY is intended to be extensible to other RR types.
+    ///
+    ///   1.3. This document intentionally gives more definition to the roles
+    ///   of "Primary", "Secondary" and "Stealth" servers, their enumeration in NS
+    ///   RRs, and the SOA MNAME field.  In that sense, this document can be
+    ///   considered an addendum to [RFC1035].
+    ///
+    /// ```
+    ///
+    /// The below section describes how the Notify message should be constructed. The function
+    ///  implementation accepts a Record, but the actual data of the record should be ignored by the
+    ///  server, i.e. the server should make a request subsequent to receiving this Notification for
+    ///  the authority record, but could be used to decide to request an update or not:
+    ///
+    /// ```text
+    ///   3.7. A NOTIFY request has QDCOUNT>0, ANCOUNT>=0, AUCOUNT>=0,
+    ///   ADCOUNT>=0.  If ANCOUNT>0, then the answer section represents an
+    ///   unsecure hint at the new RRset for this <QNAME,QCLASS,QTYPE>.  A
+    ///   Secondary receiving such a hint is free to treat equivalence of this
+    ///   answer section with its local data as a "no further work needs to be
+    ///   done" indication.  If ANCOUNT=0, or ANCOUNT>0 and the answer section
+    ///   differs from the Secondary's local data, then the Secondary should query its
+    ///   known Primaries to retrieve the new data.
+    /// ```
+    ///
+    /// Client's should be ready to handle, or be aware of, a server response of NOTIMP:
+    ///
+    /// ```text
+    ///   3.12. If a NOTIFY request is received by a Secondary who does not
+    ///   implement the NOTIFY opcode, it will respond with a NOTIMP
+    ///   (unimplemented feature error) message.  A Primary Zone Server who receives
+    ///   such a NOTIMP should consider the NOTIFY transaction complete for
+    ///   that Secondary.
+    /// ```
     ///
     /// # Arguments
     ///
@@ -142,13 +229,49 @@ pub trait Client {
         query_class: DNSClass,
         query_type: RecordType,
         rrset: Option<R>,
-    ) -> ClientResult<DnsResponse>
+    ) -> ClientResponse<<Self as DnsHandle>::Response>
     where
         R: Into<RecordSet>,
     {
-        let (mut client, runtime) = self.spawn_client()?;
+        debug!("notifying: {} {:?}", name, query_type);
 
-        runtime.block_on(client.notify(name, query_class, query_type, rrset))
+        // build the message
+        let mut message: Message = Message::new();
+        let id: u16 = rand::random();
+        message
+            .set_id(id)
+            // 3.3. NOTIFY is similar to QUERY in that it has a request message with
+            // the header QR flag "clear" and a response message with QR "set".  The
+            // response message contains no useful information, but its reception by
+            // the Primary is an indication that the Secondary has received the NOTIFY
+            // and that the Primary Zone Server can remove the Secondary from any retry queue for
+            // this NOTIFY event.
+            .set_message_type(MessageType::Query)
+            .set_op_code(OpCode::Notify);
+
+        // Extended dns
+        if self.is_using_edns() {
+            message
+                .extensions_mut()
+                .get_or_insert_with(Edns::new)
+                .set_max_payload(update_message::MAX_PAYLOAD_LEN)
+                .set_version(0);
+        }
+
+        // add the query
+        let mut query: Query = Query::new();
+        query
+            .set_name(name)
+            .set_query_class(query_class)
+            .set_query_type(query_type);
+        message.add_query(query);
+
+        // add the notify message, see https://tools.ietf.org/html/rfc1996, section 3.7
+        if let Some(rrset) = rrset {
+            message.add_answers(rrset.into());
+        }
+
+        ClientResponse(self.send(message))
     }
 
     /// Sends a record to create on the server, this will fail if the record exists (atomicity
@@ -174,8 +297,8 @@ pub trait Client {
     ///
     ///    RRs are added to the Update Section whose NAME, TYPE, TTL, RDLENGTH
     ///    and RDATA are those being added, and CLASS is the same as the zone
-    ///    class.  Any duplicate RRs will be silently ignored by the Primary
-    ///    Zone Server.
+    ///    class.  Any duplicate RRs will be silently ignored by the Primary Zone
+    ///    Server.
     /// ```
     ///
     /// # Arguments
@@ -184,13 +307,18 @@ pub trait Client {
     /// * `zone_origin` - the zone name to update, i.e. SOA name
     ///
     /// The update must go to a zone authority (i.e. the server used in the ClientConnection)
-    fn create<R>(&self, rrset: R, zone_origin: Name) -> ClientResult<DnsResponse>
+    fn create<R>(
+        &mut self,
+        rrset: R,
+        zone_origin: Name,
+    ) -> ClientResponse<<Self as DnsHandle>::Response>
     where
         R: Into<RecordSet>,
     {
-        let (mut client, runtime) = self.spawn_client()?;
+        let rrset = rrset.into();
+        let message = update_message::create(rrset, zone_origin, self.is_using_edns());
 
-        runtime.block_on(client.create(rrset, zone_origin))
+        ClientResponse(self.send(message))
     }
 
     /// Appends a record to an existing rrset, optionally require the rrset to exist (atomicity
@@ -215,8 +343,8 @@ pub trait Client {
     ///
     ///    RRs are added to the Update Section whose NAME, TYPE, TTL, RDLENGTH
     ///    and RDATA are those being added, and CLASS is the same as the zone
-    ///    class.  Any duplicate RRs will be silently ignored by the Primary
-    ///    Zone Server.
+    ///    class.  Any duplicate RRs will be silently ignored by the Primary Zone
+    ///    Server.
     /// ```
     ///
     /// # Arguments
@@ -227,13 +355,19 @@ pub trait Client {
     ///
     /// The update must go to a zone authority (i.e. the server used in the ClientConnection). If
     /// the rrset does not exist and must_exist is false, then the RRSet will be created.
-    fn append<R>(&self, rrset: R, zone_origin: Name, must_exist: bool) -> ClientResult<DnsResponse>
+    fn append<R>(
+        &mut self,
+        rrset: R,
+        zone_origin: Name,
+        must_exist: bool,
+    ) -> ClientResponse<<Self as DnsHandle>::Response>
     where
         R: Into<RecordSet>,
     {
-        let (mut client, runtime) = self.spawn_client()?;
+        let rrset = rrset.into();
+        let message = update_message::append(rrset, zone_origin, must_exist, self.is_using_edns());
 
-        runtime.block_on(client.append(rrset, zone_origin, must_exist))
+        ClientResponse(self.send(message))
     }
 
     /// Compares and if it matches, swaps it for the new value (atomicity depends on the server)
@@ -277,19 +411,22 @@ pub trait Client {
     /// * `zone_origin` - the zone name to update, i.e. SOA name
     ///
     /// The update must go to a zone authority (i.e. the server used in the ClientConnection).
-    fn compare_and_swap<CR, NR>(
-        &self,
-        current: CR,
-        new: NR,
+    fn compare_and_swap<C, N>(
+        &mut self,
+        current: C,
+        new: N,
         zone_origin: Name,
-    ) -> ClientResult<DnsResponse>
+    ) -> ClientResponse<<Self as DnsHandle>::Response>
     where
-        CR: Into<RecordSet>,
-        NR: Into<RecordSet>,
+        C: Into<RecordSet>,
+        N: Into<RecordSet>,
     {
-        let (mut client, runtime) = self.spawn_client()?;
+        let current = current.into();
+        let new = new.into();
 
-        runtime.block_on(client.compare_and_swap(current, new, zone_origin))
+        let message =
+            update_message::compare_and_swap(current, new, zone_origin, self.is_using_edns());
+        ClientResponse(self.send(message))
     }
 
     /// Deletes a record (by rdata) from an rrset, optionally require the rrset to exist.
@@ -324,16 +461,22 @@ pub trait Client {
     /// * `rrset` - the record(s) to delete from a RRSet, the name, type and rdata must match the
     ///              record to delete
     /// * `zone_origin` - the zone name to update, i.e. SOA name
+    /// * `signer` - the signer, with private key, to use to sign the request
     ///
     /// The update must go to a zone authority (i.e. the server used in the ClientConnection). If
     /// the rrset does not exist and must_exist is false, then the RRSet will be deleted.
-    fn delete_by_rdata<R>(&self, record: R, zone_origin: Name) -> ClientResult<DnsResponse>
+    fn delete_by_rdata<R>(
+        &mut self,
+        rrset: R,
+        zone_origin: Name,
+    ) -> ClientResponse<<Self as DnsHandle>::Response>
     where
         R: Into<RecordSet>,
     {
-        let (mut client, runtime) = self.spawn_client()?;
+        let rrset = rrset.into();
+        let message = update_message::delete_by_rdata(rrset, zone_origin, self.is_using_edns());
 
-        runtime.block_on(client.delete_by_rdata(record, zone_origin))
+        ClientResponse(self.send(message))
     }
 
     /// Deletes an entire rrset, optionally require the rrset to exist.
@@ -357,7 +500,7 @@ pub trait Client {
     ///
     ///   One RR is added to the Update Section whose NAME and TYPE are those
     ///   of the RRset to be deleted.  TTL must be specified as zero (0) and is
-    ///   otherwise not used by the Primary Zone Sever.  CLASS must be specified as
+    ///   otherwise not used by the Primary Zone Server.  CLASS must be specified as
     ///   ANY.  RDLENGTH must be zero (0) and RDATA must therefore be empty.
     ///   If no such RRset exists, then this Update RR will be silently ignored
     ///   by the Primary Zone Server.
@@ -365,16 +508,20 @@ pub trait Client {
     ///
     /// # Arguments
     ///
-    /// * `record` - the record to delete from a RRSet, the name, and type must match the
-    ///              record set to delete
+    /// * `record` - The name, class and record_type will be used to match and delete the RecordSet
     /// * `zone_origin` - the zone name to update, i.e. SOA name
     ///
     /// The update must go to a zone authority (i.e. the server used in the ClientConnection). If
     /// the rrset does not exist and must_exist is false, then the RRSet will be deleted.
-    fn delete_rrset(&self, record: Record, zone_origin: Name) -> ClientResult<DnsResponse> {
-        let (mut client, runtime) = self.spawn_client()?;
+    fn delete_rrset(
+        &mut self,
+        record: Record,
+        zone_origin: Name,
+    ) -> ClientResponse<<Self as DnsHandle>::Response> {
+        assert!(zone_origin.zone_of(record.name()));
+        let message = update_message::delete_rrset(record, zone_origin, self.is_using_edns());
 
-        runtime.block_on(client.delete_rrset(record, zone_origin))
+        ClientResponse(self.send(message))
     }
 
     /// Deletes all records at the specified name
@@ -402,14 +549,20 @@ pub trait Client {
     /// operation attempts to delete all resource record sets the specified name regardless of
     /// the record type.
     fn delete_all(
-        &self,
+        &mut self,
         name_of_records: Name,
         zone_origin: Name,
         dns_class: DNSClass,
-    ) -> ClientResult<DnsResponse> {
-        let (mut client, runtime) = self.spawn_client()?;
+    ) -> ClientResponse<<Self as DnsHandle>::Response> {
+        assert!(zone_origin.zone_of(&name_of_records));
+        let message = update_message::delete_all(
+            name_of_records,
+            zone_origin,
+            dns_class,
+            self.is_using_edns(),
+        );
 
-        runtime.block_on(client.delete_all(name_of_records, zone_origin, dns_class))
+        ClientResponse(self.send(message))
     }
 
     /// Download all records from a zone, or all records modified since given SOA was observed.
@@ -420,219 +573,557 @@ pub trait Client {
     /// * `zone_origin` - the zone name to update, i.e. SOA name
     /// * `last_soa` - the last SOA known, if any. If provided, name must match `zone_origin`
     fn zone_transfer(
-        &self,
-        name: &Name,
+        &mut self,
+        zone_origin: Name,
         last_soa: Option<SOA>,
-    ) -> ClientResult<BlockingStream<ClientStreamXfr<<Self as Client>::Response>>> {
-        let (mut client, runtime) = self.spawn_client()?;
+    ) -> ClientStreamXfr<<Self as DnsHandle>::Response> {
+        let ixfr = last_soa.is_some();
+        let message = update_message::zone_transfer(zone_origin, last_soa);
 
-        Ok(BlockingStream {
-            inner: client.zone_transfer(name.clone(), last_soa),
-            runtime,
-        })
+        ClientStreamXfr::new(self.send(message), ixfr)
     }
 }
 
-/// The Client is abstracted over either trust_dns_client::tcp::TcpClientConnection or
-///  trust_dns_client::udp::UdpClientConnection.
-///
-/// Usage of TCP or UDP is up to the user. Some DNS servers
-///  disallow TCP in some cases, so if TCP double check if UDP works.
-pub struct SyncClient<CC: ClientConnection> {
-    conn: CC,
-    signer: Option<Arc<Signer>>,
-}
-
-impl<CC: ClientConnection> SyncClient<CC> {
-    /// Creates a new DNS client with the specified connection type
-    ///
-    /// # Arguments
-    ///
-    /// * `conn` - the [`ClientConnection`] to use for all communication
-    pub fn new(conn: CC) -> Self {
-        Self { conn, signer: None }
-    }
-
-    /// Creates a new DNS client with the specified connection type and a SIG0 signer.
-    ///
-    /// This is necessary for signed update requests to update trust-dns-server entries.
-    ///
-    /// # Arguments
-    ///
-    /// * `conn` - the [`ClientConnection`] to use for all communication
-    /// * `signer` - signer to use, this needs an associated private key
-    #[cfg(feature = "dnssec")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "dnssec")))]
-    pub fn with_signer(conn: CC, signer: SigSigner) -> Self {
-        Self {
-            conn,
-            signer: Some(Arc::new(signer.into())),
-        }
-    }
-
-    /// Creates a new DNS client with the specified connection type and TSIG signer.
-    ///
-    /// This is necessary for signed update requests to update certain servers entries.
-    ///
-    /// # Arguments
-    ///
-    /// * `conn` - the [`ClientConnection`] to use for all communication
-    /// * `signer` - signer to use
-    #[cfg(feature = "dnssec")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "dnssec")))]
-    pub fn with_tsigner(conn: CC, signer: TSigner) -> Self {
-        Self {
-            conn,
-            signer: Some(Arc::new(signer.into())),
-        }
-    }
-}
-
-impl<CC: ClientConnection> Client for SyncClient<CC> {
-    type Response = DnsExchangeSend;
-    type Handle = AsyncClient;
-
-    fn new_future(&self) -> NewFutureObj<Self::Handle> {
-        let stream = self.conn.new_stream(self.signer.clone());
-
-        let connect = async move {
-            let (client, bg) = AsyncClient::connect(stream).await?;
-
-            let bg = Box::new(bg) as _;
-            Ok((client, bg))
-        };
-
-        Box::pin(connect)
-    }
-}
-
-/// An iterator based on a `Stream` of dns response.
-/// Calling `next` on this iterator is a blocking operation.
-pub struct BlockingStream<T> {
-    inner: T,
-    runtime: Runtime,
-}
-
-impl<T, R> Iterator for BlockingStream<T>
+/// A stream result of a Client Request
+#[must_use = "stream do nothing unless polled"]
+pub struct ClientStreamingResponse<R>(pub(crate) R)
 where
-    T: Stream<Item = R> + Unpin,
-    R: Into<ClientResult<DnsResponse>>,
+    R: Stream<Item = Result<DnsResponse, ProtoError>> + Send + Unpin + 'static;
+
+impl<R> Stream for ClientStreamingResponse<R>
+where
+    R: Stream<Item = Result<DnsResponse, ProtoError>> + Send + Unpin + 'static,
 {
-    type Item = ClientResult<DnsResponse>;
-    fn next(&mut self) -> Option<Self::Item> {
-        self.runtime.block_on(self.inner.next()).map(Into::into)
+    type Item = Result<DnsResponse, ClientError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(ready!(self.0.poll_next_unpin(cx)).map(|r| r.map_err(ClientError::from)))
     }
 }
 
-/// A DNS client which will validate DNSSec records upon receipt
-#[cfg(feature = "dnssec")]
-#[cfg_attr(docsrs, doc(cfg(feature = "dnssec")))]
-pub struct SyncDnssecClient<CC: ClientConnection> {
-    conn: CC,
-    signer: Option<Arc<Signer>>,
-    trust_anchor: Option<TrustAnchor>,
+/// A future result of a Client Request
+#[must_use = "futures do nothing unless polled"]
+pub struct ClientResponse<R>(pub(crate) R)
+where
+    R: Stream<Item = Result<DnsResponse, ProtoError>> + Send + Unpin + 'static;
+
+impl<R> Future for ClientResponse<R>
+where
+    R: Stream<Item = Result<DnsResponse, ProtoError>> + Send + Unpin + 'static,
+{
+    type Output = Result<DnsResponse, ClientError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Poll::Ready(
+            match ready!(self.0.poll_next_unpin(cx)) {
+                Some(r) => r,
+                None => Err(ProtoError::from(ProtoErrorKind::Timeout)),
+            }
+            .map_err(ClientError::from),
+        )
+    }
 }
 
-#[cfg(feature = "dnssec")]
-impl<CC: ClientConnection> SyncDnssecClient<CC> {
-    /// Creates a new DNS client with the specified connection type
-    ///
-    /// # Arguments
-    ///
-    /// * `client_connection` - the client_connection to use for all communication
-    #[allow(clippy::new_ret_no_self)]
-    pub fn new(conn: CC) -> SecureSyncClientBuilder<CC> {
-        SecureSyncClientBuilder {
-            conn,
-            trust_anchor: None,
-            signer: None,
+/// A stream result of a zone transfer Client Request
+/// Accept messages until the end of a zone transfer. For AXFR, it search for a starting and an
+/// ending SOA. For IXFR, it do so taking into account there will be other SOA inbetween
+#[must_use = "stream do nothing unless polled"]
+pub struct ClientStreamXfr<R>
+where
+    R: Stream<Item = Result<DnsResponse, ProtoError>> + Send + Unpin + 'static,
+{
+    state: ClientStreamXfrState<R>,
+}
+
+impl<R> ClientStreamXfr<R>
+where
+    R: Stream<Item = Result<DnsResponse, ProtoError>> + Send + Unpin + 'static,
+{
+    fn new(inner: R, maybe_incr: bool) -> Self {
+        Self {
+            state: ClientStreamXfrState::Start { inner, maybe_incr },
         }
     }
 }
 
-#[cfg(feature = "dnssec")]
-impl<CC: ClientConnection> Client for SyncDnssecClient<CC> {
-    type Response = Pin<Box<(dyn Stream<Item = Result<DnsResponse, ProtoError>> + Send + 'static)>>;
-    type Handle = AsyncDnssecClient;
+/// State machine for ClientStreamXfr, implementing almost all logic
+#[derive(Debug)]
+enum ClientStreamXfrState<R> {
+    Start {
+        inner: R,
+        maybe_incr: bool,
+    },
+    Second {
+        inner: R,
+        expected_serial: u32,
+        maybe_incr: bool,
+    },
+    Axfr {
+        inner: R,
+        expected_serial: u32,
+    },
+    Ixfr {
+        inner: R,
+        even: bool,
+        expected_serial: u32,
+    },
+    Ended,
+    Invalid,
+}
 
-    #[allow(clippy::type_complexity)]
-    fn new_future(&self) -> NewFutureObj<Self::Handle> {
-        let stream = self.conn.new_stream(self.signer.clone());
-        let mut builder = AsyncDnssecClient::builder(stream);
-        if let Some(trust_anchor) = &self.trust_anchor {
-            builder = builder.trust_anchor(trust_anchor.clone());
+impl<R> ClientStreamXfrState<R> {
+    /// Helper to get the stream from the enum
+    fn inner(&mut self) -> &mut R {
+        use ClientStreamXfrState::*;
+        match self {
+            Start { inner, .. } => inner,
+            Second { inner, .. } => inner,
+            Axfr { inner, .. } => inner,
+            Ixfr { inner, .. } => inner,
+            Ended | Invalid => unreachable!(),
         }
-        let connect = builder.build();
+    }
 
-        let connect = async move {
-            let (client, bg) = connect.await?;
+    /// Helper to ingest answer Records
+    // TODO: this is complex enough it should get its own tests
+    fn process(&mut self, answers: &[Record]) -> Result<(), ClientError> {
+        use ClientStreamXfrState::*;
+        fn get_serial(r: &Record) -> Option<u32> {
+            r.data().as_soa().map(SOA::serial)
+        }
 
-            let bg = Box::new(bg) as _;
-            Ok((client, bg))
-        };
-
-        Box::pin(connect)
+        if answers.is_empty() {
+            return Ok(());
+        }
+        match std::mem::replace(self, Invalid) {
+            Start { inner, maybe_incr } => {
+                if let Some(expected_serial) = get_serial(&answers[0]) {
+                    *self = Second {
+                        inner,
+                        maybe_incr,
+                        expected_serial,
+                    };
+                    self.process(&answers[1..])
+                } else {
+                    *self = Ended;
+                    Ok(())
+                }
+            }
+            Second {
+                inner,
+                maybe_incr,
+                expected_serial,
+            } => {
+                if let Some(serial) = get_serial(&answers[0]) {
+                    // maybe IXFR, or empty AXFR
+                    if serial == expected_serial {
+                        // empty AXFR
+                        *self = Ended;
+                        if answers.len() == 1 {
+                            Ok(())
+                        } else {
+                            // invalid answer : trailing records
+                            Err(ClientErrorKind::Message(
+                                "invalid zone transfer, contains trailing records",
+                            )
+                            .into())
+                        }
+                    } else if maybe_incr {
+                        *self = Ixfr {
+                            inner,
+                            expected_serial,
+                            even: true,
+                        };
+                        self.process(&answers[1..])
+                    } else {
+                        *self = Ended;
+                        Err(ClientErrorKind::Message(
+                            "invalid zone transfer, expected AXFR, got IXFR",
+                        )
+                        .into())
+                    }
+                } else {
+                    // standard AXFR
+                    *self = Axfr {
+                        inner,
+                        expected_serial,
+                    };
+                    self.process(&answers[1..])
+                }
+            }
+            Axfr {
+                inner,
+                expected_serial,
+            } => {
+                let soa_count = answers
+                    .iter()
+                    .filter(|a| a.record_type() == RecordType::SOA)
+                    .count();
+                match soa_count {
+                    0 => {
+                        *self = Axfr {
+                            inner,
+                            expected_serial,
+                        };
+                        Ok(())
+                    }
+                    1 => {
+                        *self = Ended;
+                        match answers.last().map(|r| r.record_type()) {
+                            Some(RecordType::SOA) => Ok(()),
+                            _ => Err(ClientErrorKind::Message(
+                                "invalid zone transfer, contains trailing records",
+                            )
+                            .into()),
+                        }
+                    }
+                    _ => {
+                        *self = Ended;
+                        Err(ClientErrorKind::Message(
+                            "invalid zone transfer, contains trailing records",
+                        )
+                        .into())
+                    }
+                }
+            }
+            Ixfr {
+                inner,
+                even,
+                expected_serial,
+            } => {
+                let even = answers
+                    .iter()
+                    .fold(even, |even, a| even ^ (a.record_type() == RecordType::SOA));
+                if even {
+                    if let Some(serial) = get_serial(answers.last().unwrap()) {
+                        if serial == expected_serial {
+                            *self = Ended;
+                            return Ok(());
+                        }
+                    }
+                }
+                *self = Ixfr {
+                    inner,
+                    even,
+                    expected_serial,
+                };
+                Ok(())
+            }
+            Ended | Invalid => {
+                unreachable!();
+            }
+        }
     }
 }
 
-#[cfg(feature = "dnssec")]
-#[cfg_attr(docsrs, doc(cfg(feature = "dnssec")))]
-pub struct SecureSyncClientBuilder<CC: ClientConnection> {
-    conn: CC,
-    signer: Option<Arc<Signer>>,
-    trust_anchor: Option<TrustAnchor>,
-}
+impl<R> Stream for ClientStreamXfr<R>
+where
+    R: Stream<Item = Result<DnsResponse, ProtoError>> + Send + Unpin + 'static,
+{
+    type Item = Result<DnsResponse, ClientError>;
 
-#[cfg(feature = "dnssec")]
-impl<CC: ClientConnection> SecureSyncClientBuilder<CC> {
-    /// This variant allows for the trust_anchor to be replaced
-    ///
-    /// # Arguments
-    ///
-    /// * `trust_anchor` - the set of trusted DNSKEY public_keys, by default this only contains the
-    ///                    root public_key.
-    pub fn trust_anchor(mut self, trust_anchor: TrustAnchor) -> Self {
-        self.trust_anchor = Some(trust_anchor);
-        self
-    }
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        use ClientStreamXfrState::*;
 
-    /// Associate a signer to produce a SIG0 for all update requests
-    ///
-    /// This is necessary for signed update requests to update trust-dns-server entries
-    ///
-    /// # Arguments
-    ///
-    /// * `signer` - signer to use, this needs an associated private key
-    pub fn signer(mut self, signer: Signer) -> Self {
-        self.signer = Some(Arc::new(signer));
-        self
-    }
-
-    pub fn build(self) -> SyncDnssecClient<CC> {
-        SyncDnssecClient {
-            conn: self.conn,
-            signer: self.signer,
-            trust_anchor: self.trust_anchor,
+        if matches!(self.state, Ended) {
+            return Poll::Ready(None);
         }
+
+        let message = ready!(self.state.inner().poll_next_unpin(cx)).map(|response| {
+            let ok = response?;
+            self.state.process(ok.answers())?;
+            Ok(ok)
+        });
+        Poll::Ready(message)
     }
 }
 
 #[cfg(test)]
-fn assert_send_and_sync<T: Send + Sync>() {}
+mod tests {
+    use std::net::SocketAddr;
 
-#[test]
-fn test_sync_client_send_and_sync() {
-    use crate::tcp::TcpClientConnection;
-    use crate::udp::UdpClientConnection;
-    assert_send_and_sync::<SyncClient<UdpClientConnection>>();
-    assert_send_and_sync::<SyncClient<TcpClientConnection>>();
-}
+    use super::*;
 
-#[test]
-#[cfg(feature = "dnssec")]
-fn test_secure_client_send_and_sync() {
-    use crate::tcp::TcpClientConnection;
-    use crate::udp::UdpClientConnection;
-    assert_send_and_sync::<SyncDnssecClient<UdpClientConnection>>();
-    assert_send_and_sync::<SyncDnssecClient<TcpClientConnection>>();
+    use ClientStreamXfrState::*;
+    use futures_util::stream::iter;
+    use hickory_proto::{
+        rr::{
+            RData,
+            rdata::{A, SOA},
+        },
+        runtime::TokioRuntimeProvider,
+    };
+    use test_support::subscribe;
+
+    fn soa_record(serial: u32) -> Record {
+        let soa = RData::SOA(SOA::new(
+            Name::from_ascii("example.com.").unwrap(),
+            Name::from_ascii("admin.example.com.").unwrap(),
+            serial,
+            60,
+            60,
+            60,
+            60,
+        ));
+        Record::from_rdata(Name::from_ascii("example.com.").unwrap(), 600, soa)
+    }
+
+    fn a_record(ip: u8) -> Record {
+        let a = RData::A(A::new(0, 0, 0, ip));
+        Record::from_rdata(Name::from_ascii("www.example.com.").unwrap(), 600, a)
+    }
+
+    fn get_stream_testcase(
+        records: Vec<Vec<Record>>,
+    ) -> impl Stream<Item = Result<DnsResponse, ProtoError>> + Send + Unpin + 'static {
+        let stream = records.into_iter().map(|r| {
+            Ok({
+                let mut m = Message::new();
+                m.insert_answers(r);
+                DnsResponse::from_message(m).unwrap()
+            })
+        });
+        iter(stream)
+    }
+
+    #[tokio::test]
+    async fn test_stream_xfr_valid_axfr() {
+        subscribe();
+        let stream = get_stream_testcase(vec![vec![
+            soa_record(3),
+            a_record(1),
+            a_record(2),
+            soa_record(3),
+        ]]);
+        let mut stream = ClientStreamXfr::new(stream, false);
+        assert!(matches!(stream.state, Start { .. }));
+
+        let response = stream.next().await.unwrap().unwrap();
+        assert!(matches!(stream.state, Ended));
+        assert_eq!(response.answers().len(), 4);
+
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_stream_xfr_valid_axfr_multipart() {
+        subscribe();
+        let stream = get_stream_testcase(vec![
+            vec![soa_record(3)],
+            vec![a_record(1)],
+            vec![soa_record(3)],
+            vec![a_record(2)], // will be ignored as connection is dropped before reading this message
+        ]);
+        let mut stream = ClientStreamXfr::new(stream, false);
+        assert!(matches!(stream.state, Start { .. }));
+
+        let response = stream.next().await.unwrap().unwrap();
+        assert!(matches!(stream.state, Second { .. }));
+        assert_eq!(response.answers().len(), 1);
+
+        let response = stream.next().await.unwrap().unwrap();
+        assert!(matches!(stream.state, Axfr { .. }));
+        assert_eq!(response.answers().len(), 1);
+
+        let response = stream.next().await.unwrap().unwrap();
+        assert!(matches!(stream.state, Ended));
+        assert_eq!(response.answers().len(), 1);
+
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_stream_xfr_empty_axfr() {
+        subscribe();
+        let stream = get_stream_testcase(vec![vec![soa_record(3)], vec![soa_record(3)]]);
+        let mut stream = ClientStreamXfr::new(stream, false);
+        assert!(matches!(stream.state, Start { .. }));
+
+        let response = stream.next().await.unwrap().unwrap();
+        assert!(matches!(stream.state, Second { .. }));
+        assert_eq!(response.answers().len(), 1);
+
+        let response = stream.next().await.unwrap().unwrap();
+        assert!(matches!(stream.state, Ended));
+        assert_eq!(response.answers().len(), 1);
+
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_stream_xfr_axfr_with_ixfr_reply() {
+        subscribe();
+        let stream = get_stream_testcase(vec![vec![
+            soa_record(3),
+            soa_record(2),
+            a_record(1),
+            soa_record(3),
+            a_record(2),
+            soa_record(3),
+        ]]);
+        let mut stream = ClientStreamXfr::new(stream, false);
+        assert!(matches!(stream.state, Start { .. }));
+
+        stream.next().await.unwrap().unwrap_err();
+        assert!(matches!(stream.state, Ended));
+
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_stream_xfr_axfr_with_non_xfr_reply() {
+        subscribe();
+        let stream = get_stream_testcase(vec![
+            vec![a_record(1)], // assume this is an error response, not a zone transfer
+            vec![a_record(2)],
+        ]);
+        let mut stream = ClientStreamXfr::new(stream, false);
+        assert!(matches!(stream.state, Start { .. }));
+
+        let response = stream.next().await.unwrap().unwrap();
+        assert!(matches!(stream.state, Ended));
+        assert_eq!(response.answers().len(), 1);
+
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_stream_xfr_invalid_axfr_multipart() {
+        subscribe();
+        let stream = get_stream_testcase(vec![
+            vec![soa_record(3)],
+            vec![a_record(1)],
+            vec![soa_record(3), a_record(2)],
+            vec![soa_record(3)],
+        ]);
+        let mut stream = ClientStreamXfr::new(stream, false);
+        assert!(matches!(stream.state, Start { .. }));
+
+        let response = stream.next().await.unwrap().unwrap();
+        assert!(matches!(stream.state, Second { .. }));
+        assert_eq!(response.answers().len(), 1);
+
+        let response = stream.next().await.unwrap().unwrap();
+        assert!(matches!(stream.state, Axfr { .. }));
+        assert_eq!(response.answers().len(), 1);
+
+        stream.next().await.unwrap().unwrap_err();
+        assert!(matches!(stream.state, Ended));
+
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_stream_xfr_valid_ixfr() {
+        subscribe();
+        let stream = get_stream_testcase(vec![vec![
+            soa_record(3),
+            soa_record(2),
+            a_record(1),
+            soa_record(3),
+            a_record(2),
+            soa_record(3),
+        ]]);
+        let mut stream = ClientStreamXfr::new(stream, true);
+        assert!(matches!(stream.state, Start { .. }));
+
+        let response = stream.next().await.unwrap().unwrap();
+        assert!(matches!(stream.state, Ended));
+        assert_eq!(response.answers().len(), 6);
+
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_stream_xfr_valid_ixfr_multipart() {
+        subscribe();
+        let stream = get_stream_testcase(vec![
+            vec![soa_record(3)],
+            vec![soa_record(2)],
+            vec![a_record(1)],
+            vec![soa_record(3)],
+            vec![a_record(2)],
+            vec![soa_record(3)],
+            vec![a_record(3)], //
+        ]);
+        let mut stream = ClientStreamXfr::new(stream, true);
+        assert!(matches!(stream.state, Start { .. }));
+
+        let response = stream.next().await.unwrap().unwrap();
+        assert!(matches!(stream.state, Second { .. }));
+        assert_eq!(response.answers().len(), 1);
+
+        let response = stream.next().await.unwrap().unwrap();
+        assert!(matches!(stream.state, Ixfr { even: true, .. }));
+        assert_eq!(response.answers().len(), 1);
+
+        let response = stream.next().await.unwrap().unwrap();
+        assert!(matches!(stream.state, Ixfr { even: true, .. }));
+        assert_eq!(response.answers().len(), 1);
+
+        let response = stream.next().await.unwrap().unwrap();
+        assert!(matches!(stream.state, Ixfr { even: false, .. }));
+        assert_eq!(response.answers().len(), 1);
+
+        let response = stream.next().await.unwrap().unwrap();
+        assert!(matches!(stream.state, Ixfr { even: false, .. }));
+        assert_eq!(response.answers().len(), 1);
+
+        let response = stream.next().await.unwrap().unwrap();
+        assert!(matches!(stream.state, Ended));
+        assert_eq!(response.answers().len(), 1);
+
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn async_client() {
+        subscribe();
+        use crate::client::{Client, ClientHandle};
+        use hickory_proto::{
+            rr::{DNSClass, Name, RData, RecordType},
+            tcp::TcpClientStream,
+        };
+        use std::str::FromStr;
+
+        // Since we used UDP in the previous examples, let's change things up a bit and use TCP here
+        let addr = SocketAddr::from(([8, 8, 8, 8], 53));
+        let (stream, sender) = TcpClientStream::new(addr, None, None, TokioRuntimeProvider::new());
+
+        // Create a new client, the bg is a background future which handles
+        //   the multiplexing of the DNS requests to the server.
+        //   the client is a handle to an unbounded queue for sending requests via the
+        //   background. The background must be scheduled to run before the client can
+        //   send any dns requests
+        let client = Client::new(stream, sender, None);
+
+        // await the connection to be established
+        let (mut client, bg) = client.await.expect("connection failed");
+
+        // make sure to run the background task
+        tokio::spawn(bg);
+
+        // Create a query future
+        let query = client.query(
+            Name::from_str("www.example.com.").unwrap(),
+            DNSClass::IN,
+            RecordType::A,
+        );
+
+        // wait for its response
+        let (message_returned, buffer) = query.await.unwrap().into_parts();
+
+        // validate it's what we expected
+        if let RData::A(addr) = message_returned.answers()[0].data() {
+            assert_eq!(*addr, A::new(93, 184, 215, 14));
+        }
+
+        let message_parsed = Message::from_vec(&buffer)
+            .expect("buffer was parsed already by Client so we should be able to do it again");
+
+        // validate it's what we expected
+        if let RData::A(addr) = message_parsed.answers()[0].data() {
+            assert_eq!(*addr, A::new(93, 184, 215, 14));
+        }
+    }
 }
