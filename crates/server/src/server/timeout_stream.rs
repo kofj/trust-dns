@@ -4,10 +4,10 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use futures_util::stream::{Stream, StreamExt};
 use futures_util::FutureExt;
-use log::{debug, warn};
+use futures_util::stream::{Stream, StreamExt};
 use tokio::time::Sleep;
+use tracing::{debug, warn};
 
 /// This wraps the underlying Stream in a timeout.
 ///
@@ -83,7 +83,7 @@ where
                 r
             }
             Poll::Pending => {
-                if let Some(ref mut timeout) = self.timeout {
+                if let Some(timeout) = &mut self.timeout {
                     match timeout.poll_unpin(cx) {
                         Poll::Pending => Poll::Pending,
                         Poll::Ready(()) => {

@@ -1,20 +1,21 @@
 // Copyright 2015-2016 Benjamin Fry <benjaminfry@me.com>
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
 //! `RetryDnsHandle` allows for DnsQueries to be reattempted on failure
 
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use alloc::boxed::Box;
+use core::pin::Pin;
+use core::task::{Context, Poll};
 
 use futures_util::stream::{Stream, StreamExt};
 
+use crate::DnsHandle;
 use crate::error::{ProtoError, ProtoErrorKind};
 use crate::xfer::{DnsRequest, DnsResponse};
-use crate::DnsHandle;
 
 /// Can be used to reattempt queries if they fail
 ///
@@ -33,7 +34,6 @@ use crate::DnsHandle;
 pub struct RetryDnsHandle<H>
 where
     H: DnsHandle + Unpin + Send,
-    H::Error: RetryableError,
 {
     handle: H,
     attempts: usize,
@@ -42,7 +42,6 @@ where
 impl<H> RetryDnsHandle<H>
 where
     H: DnsHandle + Unpin + Send,
-    H::Error: RetryableError,
 {
     /// Creates a new Client handler for reattempting requests on failures.
     ///
@@ -58,12 +57,10 @@ where
 impl<H> DnsHandle for RetryDnsHandle<H>
 where
     H: DnsHandle + Send + Unpin + 'static,
-    H::Error: RetryableError,
 {
-    type Response = Pin<Box<dyn Stream<Item = Result<DnsResponse, Self::Error>> + Send + Unpin>>;
-    type Error = <H as DnsHandle>::Error;
+    type Response = Pin<Box<dyn Stream<Item = Result<DnsResponse, ProtoError>> + Send + Unpin>>;
 
-    fn send<R: Into<DnsRequest>>(&mut self, request: R) -> Self::Response {
+    fn send<R: Into<DnsRequest>>(&self, request: R) -> Self::Response {
         let request = request.into();
 
         // need to clone here so that the retry can resend if necessary...
@@ -90,11 +87,8 @@ where
     remaining_attempts: usize,
 }
 
-impl<H: DnsHandle + Unpin> Stream for RetrySendStream<H>
-where
-    <H as DnsHandle>::Error: RetryableError,
-{
-    type Item = Result<DnsResponse, <H as DnsHandle>::Error>;
+impl<H: DnsHandle + Unpin> Stream for RetrySendStream<H> {
+    type Item = Result<DnsResponse, ProtoError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // loop over the stream, on errors, spawn a new stream
@@ -131,7 +125,10 @@ pub trait RetryableError {
 
 impl RetryableError for ProtoError {
     fn should_retry(&self) -> bool {
-        true
+        !matches!(
+            self.kind(),
+            ProtoErrorKind::NoConnections | ProtoErrorKind::NoRecordsFound { .. }
+        )
     }
 
     fn attempted(&self) -> bool {
@@ -141,18 +138,18 @@ impl RetryableError for ProtoError {
 
 #[cfg(test)]
 mod test {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU16, Ordering};
+
     use super::*;
     use crate::error::*;
     use crate::op::*;
     use crate::xfer::FirstAnswer;
+
     use futures_executor::block_on;
-    use futures_util::future::*;
+    use futures_util::future::{err, ok};
     use futures_util::stream::*;
-    use std::sync::{
-        atomic::{AtomicU16, Ordering},
-        Arc,
-    };
-    use DnsHandle;
+    use test_support::subscribe;
 
     #[derive(Clone)]
     struct TestClient {
@@ -163,15 +160,14 @@ mod test {
 
     impl DnsHandle for TestClient {
         type Response = Box<dyn Stream<Item = Result<DnsResponse, ProtoError>> + Send + Unpin>;
-        type Error = ProtoError;
 
-        fn send<R: Into<DnsRequest>>(&mut self, _: R) -> Self::Response {
+        fn send<R: Into<DnsRequest>>(&self, _: R) -> Self::Response {
             let i = self.attempts.load(Ordering::SeqCst);
 
             if (i > self.retries || self.retries - i == 0) && self.last_succeed {
                 let mut message = Message::new();
                 message.set_id(i);
-                return Box::new(once(ok(message.into())));
+                return Box::new(once(ok(DnsResponse::from_message(message).unwrap())));
             }
 
             self.attempts.fetch_add(1, Ordering::SeqCst);
@@ -181,7 +177,8 @@ mod test {
 
     #[test]
     fn test_retry() {
-        let mut handle = RetryDnsHandle::new(
+        subscribe();
+        let handle = RetryDnsHandle::new(
             TestClient {
                 last_succeed: true,
                 retries: 1,
@@ -196,7 +193,8 @@ mod test {
 
     #[test]
     fn test_error() {
-        let mut client = RetryDnsHandle::new(
+        subscribe();
+        let client = RetryDnsHandle::new(
             TestClient {
                 last_succeed: false,
                 retries: 1,

@@ -1,14 +1,14 @@
-# !/bin/bash
+#!/bin/bash
 
-set -e
+set -euxo pipefail
 
-OPENSSL=/usr/local/opt/openssl/bin/openssl
+OPENSSL=openssl
 
-trust_dns_dir=$(dirname $0)/..
+hickory_dns_dir=$(dirname $0)/..
 
-pushd $trust_dns_dir/tests/test-data
+pushd $hickory_dns_dir/tests/test-data
 
-for i in ca.key ca.pem cert-key.pem cert.csr cert.pem cert.p12 ; do
+for i in ca.key ca.pem cert.key cert.csr cert.pem cert.p12 ; do
     [ -f $i ] && echo "$i exists" && exit 1;
 done
 
@@ -21,15 +21,14 @@ req_extensions = req_ext
 distinguished_name = dn
 
 [dn]
-
 C = US
 ST = California
 L = San Francisco
-O = Trust-DNS
+O = Hickory DNS
 CN = root.example.com
 
 [req_ext]
-basicConstraints = CA:TRUE
+basicConstraints = critical,CA:TRUE
 subjectAltName = @alt_names
  
 [alt_names]
@@ -38,8 +37,7 @@ EOF
 
 # CA
 echo "----> Generating CA <----"
-${OPENSSL:?} genrsa -out ca.key 4096
-${OPENSSL:?} req -x509 -new -nodes -key ca.key -days 365 -out ca.pem -verify -config /tmp/ca.conf
+${OPENSSL:?} req -x509 -new -nodes -newkey rsa:4096 -days 365 -keyout ca.key -out ca.pem -config /tmp/ca.conf
 ${OPENSSL:?} x509 -in ca.pem -out ca.der -outform der  
 
 cat <<-EOF > /tmp/cert.conf
@@ -53,7 +51,7 @@ distinguished_name = dn
 C = US
 ST = California
 L = San Francisco
-O = Trust-DNS
+O = Hickory DNS
 CN = ns.example.com
 
 [req_ext]
@@ -68,10 +66,12 @@ EOF
 
 # Cert
 echo "----> Generating CERT  <----"
-${OPENSSL:?} genrsa -out cert-key.pem 4096
-${OPENSSL:?} req -new -nodes -key cert-key.pem -out cert.csr \
+${OPENSSL:?} req -new -nodes -newkey rsa:4096 -keyout cert.key -out cert.csr \
              -verify \
              -config /tmp/cert.conf
+
+${OPENSSL:?} pkcs8 -in cert.key -inform pem -out cert-key.pk8 -topk8 -nocrypt
+
 ${OPENSSL:?} x509 -in ca.pem -inform pem -pubkey -noout > ca.pubkey
 
 echo "----> Signing Cert <----"
@@ -80,8 +80,8 @@ ${OPENSSL:?} x509 -req -days 365 -in cert.csr -CA ca.pem -CAkey ca.key  -set_ser
 echo "----> Verifying Cert <----"
 ${OPENSSL:?} verify -CAfile ca.pem cert.pem
 
-echo "----> Createing PCKS12 <----"
-${OPENSSL:?} pkcs12 -export -inkey cert-key.pem -in cert.pem -out cert.p12 -passout pass:mypass -name ns.example.com -chain -CAfile ca.pem
+echo "----> Creating PKCS12 <----"
+${OPENSSL:?} pkcs12 -export -inkey cert.key -in cert.pem -out cert.p12 -passout pass:mypass -name ns.example.com -chain -CAfile ca.pem
 
 
 popd

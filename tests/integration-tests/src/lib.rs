@@ -2,44 +2,39 @@
 #![allow(clippy::dbg_macro)]
 
 use std::{
-    fmt, io, mem,
-    net::SocketAddr,
+    fmt,
+    future::poll_fn,
+    io, mem,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll},
 };
 
 use futures::{
-    future,
+    Future, FutureExt, future,
     stream::{Stream, StreamExt},
-    Future, FutureExt,
 };
 use tokio::time::{Duration, Instant, Sleep};
 
-use trust_dns_client::{
-    client::{ClientConnection, Signer},
-    error::ClientResult,
-    op::*,
-    serialize::binary::*,
-};
-use trust_dns_proto::{
-    error::ProtoError,
+use hickory_proto::{
+    BufDnsStreamHandle, ProtoError,
+    op::Message,
     rr::Record,
-    xfer::{DnsClientStream, DnsMultiplexer, DnsMultiplexerConnect, SerialMessage, StreamReceiver},
-    BufDnsStreamHandle, TokioTime,
+    runtime::TokioTime,
+    serialize::binary::{BinDecodable, BinDecoder, BinEncoder},
+    xfer::{DnsClientStream, Protocol, SerialMessage, StreamReceiver},
 };
-use trust_dns_server::{
+use hickory_server::{
     authority::{Catalog, MessageRequest, MessageResponse},
-    server::{Protocol, Request, RequestHandler, ResponseHandler, ResponseInfo},
+    server::{Request, RequestHandler, ResponseHandler, ResponseInfo},
 };
 
-pub mod authority;
+pub mod example_authority;
 pub mod mock_client;
-#[cfg(feature = "dns-over-rustls")]
-pub mod tls_client_connection;
 
 #[allow(unused)]
 pub struct TestClientStream {
@@ -81,7 +76,7 @@ impl TestResponseHandler {
     }
 
     fn into_inner(self) -> impl Future<Output = Vec<u8>> {
-        future::poll_fn(move |_| {
+        poll_fn(move |_| {
             if self
                 .message_ready
                 .compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed)
@@ -186,7 +181,7 @@ impl fmt::Debug for TestClientStream {
     }
 }
 
-// need to do something with the message channel, otherwise the AsyncClient will think there
+// need to do something with the message channel, otherwise the Client will think there
 //  is no one listening to messages and shutdown...
 #[allow(dead_code)]
 pub struct NeverReturnsClientStream {
@@ -254,27 +249,14 @@ impl fmt::Debug for NeverReturnsClientStream {
     }
 }
 
-#[allow(dead_code)]
-pub struct NeverReturnsClientConnection {}
-
-impl NeverReturnsClientConnection {
-    pub fn new() -> ClientResult<Self> {
-        Ok(NeverReturnsClientConnection {})
-    }
-}
-
-#[allow(clippy::type_complexity)]
-impl ClientConnection for NeverReturnsClientConnection {
-    type Sender = DnsMultiplexer<NeverReturnsClientStream, Signer>;
-    type SenderFuture = DnsMultiplexerConnect<
-        Pin<Box<dyn Future<Output = Result<NeverReturnsClientStream, ProtoError>> + Send>>,
-        NeverReturnsClientStream,
-        Signer,
-    >;
-
-    fn new_stream(&self, signer: Option<Arc<Signer>>) -> Self::SenderFuture {
-        let (client_stream, handle) = NeverReturnsClientStream::new();
-
-        DnsMultiplexer::new(Box::pin(client_stream), handle, signer)
-    }
-}
+pub const GOOGLE_V4: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 53));
+pub const GOOGLE_V6: SocketAddr = SocketAddr::V6(SocketAddrV6::new(
+    Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
+    53,
+    0,
+    0,
+));
+pub const CLOUDFLARE_V4_TLS: SocketAddr =
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 443));
+pub const TEST3_V4: SocketAddr =
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 1), 53));

@@ -1,90 +1,110 @@
 [package]
-name = "trust-dns"
-version = "0.21.2"
-authors = ["Benjamin Fry <benjaminfry@me.com>"]
-edition = "2018"
+name = "hickory-dns"
 
 # A short blurb about the package. This is not rendered in any format when
 # uploaded to crates.io (aka this is not markdown)
 description = """
-Trust-DNS is a safe and secure DNS server with DNSec support.
- Eventually this could be a replacement for BIND9. The DNSSec support allows
+Hickory DNS is a safe and secure DNS server with DNSSEC support.
+ Eventually this could be a replacement for BIND9. The DNSSEC support allows
  for live signing of all records, in it does not currently support
  records signed offline. The server supports dynamic DNS with SIG0 authenticated
- requests. Trust-DNS is based on the Tokio and Futures libraries, which means
+ requests. Hickory DNS is based on the Tokio and Futures libraries, which means
  it should be easily integrated into other software that also use those
  libraries.
 """
 
-# These URLs point to more information about the repository
-documentation = "https://docs.rs/trust-dns-server"
-homepage = "http://www.trust-dns.org/index.html"
-repository = "https://github.com/bluejekyll/trust-dns"
-
-# This points to a file in the repository (relative to this Cargo.toml). The
-# contents of this file are stored and indexed in the registry.
+documentation = "https://docs.rs/hickory-dns"
 readme = "README.md"
 
-# This is a small list of keywords used to categorize and search for this
-# package.
-keywords = ["DNS", "BIND", "dig", "named", "dnssec"]
-categories = ["network-programming"]
-
-# This is a string description of the license for this package. Currently
-# crates.io will validate the license provided against a whitelist of known
-# license identifiers from https://spdx.org/licenses/. Multiple licenses can
-# be separated with a `/`
-license = "MIT/Apache-2.0"
-
-[badges]
-#github-actions = { repository = "bluejekyll/trust-dns", branch = "main", workflow = "test" }
-codecov = { repository = "bluejekyll/trust-dns", branch = "main", service = "github" }
-maintenance = { status = "actively-developed" }
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
 
 [features]
-default = ["sqlite", "resolver"]
-dnssec-openssl = ["dnssec", "trust-dns-client/dnssec-openssl", "trust-dns-proto/dnssec-openssl", "trust-dns-server/dnssec-openssl"]
-dnssec-ring = ["dnssec", "trust-dns-client/dnssec-ring", "trust-dns-proto/dnssec-ring", "trust-dns-server/dnssec-ring"]
-dnssec = []
-resolver = ["trust-dns-server/resolver"]
-sqlite = ["trust-dns-server/sqlite"]
+default = ["sqlite", "resolver", "rustls-platform-verifier", "ascii-art"]
 
-# TODO: Need to figure out how to be consistent with ring/openssl usage...
-# dns-over-https-openssl = ["dns-over-openssl", "trust-dns-client/dns-over-https-openssl", "dns-over-https"]
-dns-over-https-rustls = ["dns-over-https", "dns-over-rustls", "trust-dns-proto/dns-over-https-rustls", "trust-dns-client/dns-over-https-rustls", "trust-dns-server/dns-over-https-rustls"]
-dns-over-https = ["trust-dns-server/dns-over-https"]
+# if enabled, the hickory-dns binary will print ascii-art on start, disable to reduce the binary size
+ascii-art = []
 
-# TODO: migrate all tls and tls-openssl features to dns-over-tls, et al
-dns-over-openssl = ["dns-over-tls", "dnssec-openssl", "trust-dns-proto/dns-over-openssl", "trust-dns-client/dns-over-openssl", "trust-dns-server/dns-over-openssl"]
-dns-over-rustls = ["dns-over-tls", "dnssec-ring", "rustls", "trust-dns-proto/dns-over-rustls", "trust-dns-client/dns-over-rustls", "trust-dns-server/dns-over-rustls"]
-dns-over-tls = []
+blocklist = ["hickory-server/blocklist"]
+recursor = ["hickory-server/recursor"]
+# Recursive Resolution is Experimental!
+resolver = ["hickory-server/resolver"]
+sqlite = ["hickory-server/sqlite", "dep:rusqlite"]
 
-# This is a deprecated feature...
-tls-openssl = ["dns-over-openssl"]
-tls = ["dns-over-openssl"]
+tls-aws-lc-rs = ["hickory-server/tls-aws-lc-rs", "__tls"]
+https-aws-lc-rs = ["hickory-server/https-aws-lc-rs", "tls-aws-lc-rs", "__https"]
+quic-aws-lc-rs = ["hickory-server/quic-aws-lc-rs", "tls-aws-lc-rs", "__quic"]
+h3-aws-lc-rs = ["hickory-server/h3-aws-lc-rs", "quic-aws-lc-rs", "__h3"]
 
-# WARNING: there is a bug in the mutual tls auth code at the moment see issue #100
-# mtls = ["trust-dns-client/mtls"]
+tls-ring = ["hickory-server/tls-ring", "__tls"]
+https-ring = ["hickory-server/https-ring", "tls-ring", "__https"]
+quic-ring = ["hickory-server/quic-ring", "tls-ring", "__quic"]
+h3-ring = ["hickory-server/h3-ring", "quic-ring", "__h3"]
+
+__tls = ["dep:rustls"]
+__https = []
+__quic = []
+__h3 = []
+
+dnssec-aws-lc-rs = ["hickory-server/dnssec-aws-lc-rs", "dep:rustls-pki-types", "__dnssec"]
+dnssec-ring = ["hickory-server/dnssec-ring", "dep:rustls-pki-types", "__dnssec"]
+__dnssec = []
+
+webpki-roots = ["hickory-server/webpki-roots"]
+rustls-platform-verifier = ["hickory-server/rustls-platform-verifier"]
 
 [[bin]]
-name = "named"
-path = "src/named.rs"
+name = "hickory-dns"
+path = "src/hickory-dns.rs"
 
 [dependencies]
-clap = { version = "3.0", default-features = false, features = ["std", "cargo"] }
-futures = { version = "0.3.5", default-features = false, features = ["std"] }
-log = "0.4"
-rustls = { version = "0.20", optional = true }
-time = "0.3"
-tokio = { version = "1.0", features = ["time"] }
-trust-dns-client = { version = "0.21.1", path = "../crates/client" }
-trust-dns-proto = { version = "0.21.1", path = "../crates/proto" }
-trust-dns-server = { version = "0.21.1", path = "../crates/server" }
+# clap features:
+# - `suggestions` for advanced help with error in cli
+# - `derive` for clap derive api
+# - `help` to generate --help
+cfg-if.workspace = true
+clap = { workspace = true, default-features = false, features = ["cargo", "derive", "help", "std", "suggestions"] }
+futures-util = { workspace = true, default-features = false, features = ["std"] }
+ipnet = { workspace = true, features = ["serde"] }
+# rusqlite is actually only needed for test situations, but we need an optional dependency
+# here so we can disable it for MSRV tests (rusqlite only supports latest stable)
+rusqlite = { workspace = true, features = ["bundled", "time"], optional = true }
+socket2.workspace = true
+rustls = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"] }
+time.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio = { workspace = true, features = ["time", "rt", "signal"] }
+toml.workspace = true
+hickory-client.workspace = true
+hickory-proto.workspace = true
+hickory-server = { workspace = true, features = ["toml"] }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
-env_logger = "0.9"
-native-tls = "0.2"
-regex = "1.3.4"
-trust-dns-proto = { version = "0.21.1", path = "../crates/proto", features = ["testing", "dns-over-native-tls"] }
-trust-dns-resolver = { version = "0.21.1", path = "../crates/resolver" }
-webpki-roots = "0.22.1"
+futures-executor = { workspace = true, default-features = false, features = ["std"] }
+regex.workspace = true
+hickory-proto = { workspace = true, features = ["testing"] }
+hickory-resolver.workspace = true
+test-support.workspace = true
+toml.workspace = true
+webpki-roots.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.cargo-all-features]
+skip_optional_dependencies = true
+max_combination_size = 2
+denylist = ["__tls", "__https", "__quic", "__h3", "__dnssec"]

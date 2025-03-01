@@ -1,14 +1,16 @@
+use alloc::string::ToString;
+use alloc::sync::Arc;
+use core::sync::atomic::AtomicBool;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{atomic::AtomicBool, Arc};
+use std::println;
 
 use futures_util::stream::StreamExt;
 
-use crate::error::ProtoError;
-use crate::tcp::{Connect, TcpClientStream, TcpStream};
-use crate::xfer::dns_handle::DnsStreamHandle;
+use crate::runtime::RuntimeProvider;
+use crate::tcp::TcpStream;
 use crate::xfer::SerialMessage;
-use crate::{Executor, Time};
+use crate::xfer::dns_handle::DnsStreamHandle;
 
 const TEST_BYTES: &[u8; 8] = b"DEADBEEF";
 const TEST_BYTES_LEN: usize = 8;
@@ -25,8 +27,8 @@ fn tcp_server_setup(
         .spawn(move || {
             let succeeded = succeeded_clone;
             for _ in 0..15 {
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                if succeeded.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(core::time::Duration::from_secs(1));
+                if succeeded.load(core::sync::atomic::Ordering::Relaxed) {
                     return;
                 }
             }
@@ -34,10 +36,11 @@ fn tcp_server_setup(
             println!("Thread Killer has been awoken, killing process");
             std::process::exit(-1);
         })
-        .unwrap();
+        .expect("Thread spawning failed");
 
     // TODO: need a timeout on listen
-    let server = std::net::TcpListener::bind(SocketAddr::new(server_addr, 0)).unwrap();
+    let server = std::net::TcpListener::bind(SocketAddr::new(server_addr, 0))
+        .expect("Unable to bind a TCP socket");
     let server_addr = server.local_addr().unwrap();
 
     // an in and out server
@@ -47,10 +50,10 @@ fn tcp_server_setup(
             let (mut socket, _) = server.accept().expect("accept failed");
 
             socket
-                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .set_read_timeout(Some(core::time::Duration::from_secs(5)))
                 .unwrap(); // should receive something within 5 seconds...
             socket
-                .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                .set_write_timeout(Some(core::time::Duration::from_secs(5)))
                 .unwrap(); // should receive something within 5 seconds...
 
             for _ in 0..SEND_RECV_TIMES {
@@ -60,7 +63,7 @@ fn tcp_server_setup(
                     .read_exact(&mut len_bytes)
                     .expect("SERVER: receive failed");
                 let length =
-                    u16::from(len_bytes[0]) << 8 & 0xFF00 | u16::from(len_bytes[1]) & 0x00FF;
+                    (u16::from(len_bytes[0]) << 8) & 0xFF00 | u16::from(len_bytes[1]) & 0x00FF;
                 assert_eq!(length as usize, TEST_BYTES_LEN);
 
                 let mut buffer = [0_u8; TEST_BYTES_LEN];
@@ -85,18 +88,17 @@ fn tcp_server_setup(
 }
 
 /// Test tcp_stream.
-pub fn tcp_stream_test<S: Connect, E: Executor, TE: Time>(server_addr: IpAddr, mut exec: E) {
+pub async fn tcp_stream_test(server_addr: IpAddr, provider: impl RuntimeProvider) {
     let (succeeded, server_handle, server_addr) =
         tcp_server_setup("test_tcp_stream:server", server_addr);
 
     // setup the client, which is going to run on the testing thread...
 
-    // the tests should run within 5 seconds... right?
-    // TODO: add timeout here, so that test never hangs...
-    // let timeout = Timeout::new(Duration::from_secs(5));
-    let (stream, mut sender) = TcpStream::<S>::new::<ProtoError>(server_addr);
-
-    let mut stream = exec.block_on(stream).expect("run failed to get stream");
+    let tcp = provider
+        .connect_tcp(server_addr, None, None)
+        .await
+        .expect("connect failed");
+    let (mut stream, mut sender) = TcpStream::from_stream(tcp, server_addr);
 
     for _ in 0..SEND_RECV_TIMES {
         // test once
@@ -104,7 +106,7 @@ pub fn tcp_stream_test<S: Connect, E: Executor, TE: Time>(server_addr: IpAddr, m
             .send(SerialMessage::new(TEST_BYTES.to_vec(), server_addr))
             .expect("send failed");
 
-        let (buffer, stream_tmp) = exec.block_on(stream.into_future());
+        let (buffer, stream_tmp) = stream.into_future().await;
         stream = stream_tmp;
         let message = buffer
             .expect("no buffer received")
@@ -112,33 +114,29 @@ pub fn tcp_stream_test<S: Connect, E: Executor, TE: Time>(server_addr: IpAddr, m
         assert_eq!(message.bytes(), TEST_BYTES);
     }
 
-    succeeded.store(true, std::sync::atomic::Ordering::Relaxed);
+    succeeded.store(true, core::sync::atomic::Ordering::Relaxed);
     server_handle.join().expect("server thread failed");
 }
 
 /// Test tcp_client_stream.
-pub fn tcp_client_stream_test<S: Connect, E: Executor, TE: Time + 'static>(
-    server_addr: IpAddr,
-    mut exec: E,
-) {
+pub async fn tcp_client_stream_test(server_addr: IpAddr, provider: impl RuntimeProvider) {
     let (succeeded, server_handle, server_addr) =
         tcp_server_setup("test_tcp_client_stream:server", server_addr);
 
     // setup the client, which is going to run on the testing thread...
 
-    // the tests should run within 5 seconds... right?
-    // TODO: add timeout here, so that test never hangs...
-    // let timeout = Timeout::new(Duration::from_secs(5));
-    let (stream, mut sender) = TcpClientStream::<S>::new(server_addr);
-
-    let mut stream = exec.block_on(stream).expect("run failed to get stream");
+    let tcp = provider
+        .connect_tcp(server_addr, None, None)
+        .await
+        .expect("connect failed");
+    let (mut stream, mut sender) = TcpStream::from_stream(tcp, server_addr);
 
     for _ in 0..SEND_RECV_TIMES {
         // test once
         sender
             .send(SerialMessage::new(TEST_BYTES.to_vec(), server_addr))
             .expect("send failed");
-        let (buffer, stream_tmp) = exec.block_on(stream.into_future());
+        let (buffer, stream_tmp) = stream.into_future().await;
         stream = stream_tmp;
         let buffer = buffer
             .expect("no buffer received")
@@ -146,6 +144,6 @@ pub fn tcp_client_stream_test<S: Connect, E: Executor, TE: Time + 'static>(
         assert_eq!(buffer.bytes(), TEST_BYTES);
     }
 
-    succeeded.store(true, std::sync::atomic::Ordering::Relaxed);
+    succeeded.store(true, core::sync::atomic::Ordering::Relaxed);
     server_handle.join().expect("server thread failed");
 }

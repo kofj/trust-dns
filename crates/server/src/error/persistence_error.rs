@@ -1,20 +1,17 @@
 // Copyright 2015-2020 Benjamin Fry <benjaminfry@me.com>
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
 use std::fmt;
 
-use crate::proto::error::*;
 use thiserror::Error;
 
 #[cfg(feature = "backtrace")]
-use crate::proto::{trace, ExtBacktrace};
-
-/// An alias for results returned by functions of this crate
-pub type Result<T> = ::std::result::Result<T, Error>;
+use crate::proto::{ExtBacktrace, trace};
+use crate::proto::{ProtoError, ProtoErrorKind};
 
 /// The error kind for errors that get returned in the crate
 #[derive(Debug, Error)]
@@ -34,13 +31,12 @@ pub enum ErrorKind {
     },
 
     // foreign
-    /// An error got returned by the trust-dns-proto crate
+    /// An error got returned by the hickory-proto crate
     #[error("proto error: {0}")]
     Proto(#[from] ProtoError),
 
-    /// An error got returned from the rusqlite crate
+    /// An error got returned from the sqlite crate
     #[cfg(feature = "sqlite")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "sqlite")))]
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
@@ -68,7 +64,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         cfg_if::cfg_if! {
             if #[cfg(feature = "backtrace")] {
-                if let Some(ref backtrace) = self.backtrack {
+                if let Some(backtrace) = &self.backtrack {
                     fmt::Display::fmt(&self.kind, f)?;
                     fmt::Debug::fmt(backtrace, f)
                 } else {
@@ -93,7 +89,7 @@ impl From<ErrorKind> for Error {
 
 impl From<ProtoError> for Error {
     fn from(e: ProtoError) -> Self {
-        match *e.kind() {
+        match e.kind() {
             ProtoErrorKind::Timeout => ErrorKind::Timeout.into(),
             _ => ErrorKind::from(e).into(),
         }
@@ -101,7 +97,6 @@ impl From<ProtoError> for Error {
 }
 
 #[cfg(feature = "sqlite")]
-#[cfg_attr(docsrs, doc(cfg(feature = "sqlite")))]
 impl From<rusqlite::Error> for Error {
     fn from(e: rusqlite::Error) -> Self {
         ErrorKind::from(e).into()

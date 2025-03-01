@@ -1,28 +1,21 @@
-/*
- * Copyright (C) 2015 Benjamin Fry <benjaminfry@me.com>
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright 2015-2023 Benjamin Fry <benjaminfry@me.com>
+//
+// Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
+// copied, modified, or distributed except according to those terms.
 
 //! service records for identify port mapping for specific services on a host
-use std::fmt;
+use core::fmt;
 
-#[cfg(feature = "serde-config")]
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use crate::error::*;
-use crate::rr::domain::Name;
-use crate::serialize::binary::*;
+use crate::{
+    error::ProtoResult,
+    rr::{RData, RecordData, RecordType, domain::Name},
+    serialize::binary::{BinDecodable, BinDecoder, BinEncodable, BinEncoder},
+};
 
 /// [RFC 2782, DNS SRV RR, February 2000](https://tools.ietf.org/html/rfc2782)
 ///
@@ -84,7 +77,7 @@ use crate::serialize::binary::*;
 /// Class.
 ///
 /// ```
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct SRV {
     priority: u16,
@@ -197,44 +190,73 @@ impl SRV {
     }
 }
 
-/// Read the RData from the given Decoder
-pub fn read(decoder: &mut BinDecoder<'_>) -> ProtoResult<SRV> {
-    // SRV { priority: u16, weight: u16, port: u16, target: Name, },
-    Ok(SRV::new(
-        decoder.read_u16()?.unverified(/*any u16 is valid*/),
-        decoder.read_u16()?.unverified(/*any u16 is valid*/),
-        decoder.read_u16()?.unverified(/*any u16 is valid*/),
-        Name::read(decoder)?,
-    ))
+impl BinEncodable for SRV {
+    /// [RFC 4034](https://tools.ietf.org/html/rfc4034#section-6), DNSSEC Resource Records, March 2005
+    ///
+    /// This is accurate for all currently known name records.
+    ///
+    /// ```text
+    /// 6.2.  Canonical RR Form
+    ///
+    ///    For the purposes of DNS security, the canonical form of an RR is the
+    ///    wire format of the RR where:
+    ///
+    ///    ...
+    ///
+    ///    3.  if the type of the RR is NS, MD, MF, CNAME, SOA, MB, MG, MR, PTR,
+    ///        HINFO, MINFO, MX, HINFO, RP, AFSDB, RT, SIG, PX, NXT, NAPTR, KX,
+    ///        SRV, DNAME, A6, RRSIG, or (rfc6840 removes NSEC), all uppercase
+    ///        US-ASCII letters in the DNS names contained within the RDATA are replaced
+    ///        by the corresponding lowercase US-ASCII letters;
+    /// ```
+    fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
+        let is_canonical_names = encoder.is_canonical_names();
+
+        encoder.emit_u16(self.priority())?;
+        encoder.emit_u16(self.weight())?;
+        encoder.emit_u16(self.port())?;
+
+        // to_lowercase for rfc4034 and rfc6840
+        self.target()
+            .emit_with_lowercase(encoder, is_canonical_names)?;
+        Ok(())
+    }
 }
 
-/// [RFC 4034](https://tools.ietf.org/html/rfc4034#section-6), DNSSEC Resource Records, March 2005
-///
-/// This is accurate for all currently known name records.
-///
-/// ```text
-/// 6.2.  Canonical RR Form
-///
-///    For the purposes of DNS security, the canonical form of an RR is the
-///    wire format of the RR where:
-///
-///    ...
-///
-///    3.  if the type of the RR is NS, MD, MF, CNAME, SOA, MB, MG, MR, PTR,
-///        HINFO, MINFO, MX, HINFO, RP, AFSDB, RT, SIG, PX, NXT, NAPTR, KX,
-///        SRV, DNAME, A6, RRSIG, or (rfc6840 removes NSEC), all uppercase
-///        US-ASCII letters in the DNS names contained within the RDATA are replaced
-///        by the corresponding lowercase US-ASCII letters;
-/// ```
-pub fn emit(encoder: &mut BinEncoder<'_>, srv: &SRV) -> ProtoResult<()> {
-    let is_canonical_names = encoder.is_canonical_names();
+impl<'r> BinDecodable<'r> for SRV {
+    fn read(decoder: &mut BinDecoder<'r>) -> ProtoResult<Self> {
+        // SRV { priority: u16, weight: u16, port: u16, target: Name, },
+        Ok(Self::new(
+            decoder.read_u16()?.unverified(/*any u16 is valid*/),
+            decoder.read_u16()?.unverified(/*any u16 is valid*/),
+            decoder.read_u16()?.unverified(/*any u16 is valid*/),
+            Name::read(decoder)?,
+        ))
+    }
+}
 
-    encoder.emit_u16(srv.priority())?;
-    encoder.emit_u16(srv.weight())?;
-    encoder.emit_u16(srv.port())?;
-    srv.target()
-        .emit_with_lowercase(encoder, is_canonical_names)?;
-    Ok(())
+impl RecordData for SRV {
+    fn try_from_rdata(data: RData) -> Result<Self, RData> {
+        match data {
+            RData::SRV(data) => Ok(data),
+            _ => Err(data),
+        }
+    }
+
+    fn try_borrow(data: &RData) -> Option<&Self> {
+        match data {
+            RData::SRV(data) => Some(data),
+            _ => None,
+        }
+    }
+
+    fn record_type(&self) -> RecordType {
+        RecordType::SRV
+    }
+
+    fn into_rdata(self) -> RData {
+        RData::SRV(self)
+    }
 }
 
 /// [RFC 2782, DNS SRV RR, February 2000](https://tools.ietf.org/html/rfc2782)
@@ -265,24 +287,27 @@ impl fmt::Display for SRV {
 mod tests {
     #![allow(clippy::dbg_macro, clippy::print_stdout)]
 
+    use alloc::vec::Vec;
+    use std::println;
+
     use super::*;
 
     #[test]
     fn test() {
-        use std::str::FromStr;
+        use core::str::FromStr;
 
-        let rdata = SRV::new(1, 2, 3, Name::from_str("_dns._tcp.example.com").unwrap());
+        let rdata = SRV::new(1, 2, 3, Name::from_str("_dns._tcp.example.com.").unwrap());
 
         let mut bytes = Vec::new();
         let mut encoder: BinEncoder<'_> = BinEncoder::new(&mut bytes);
-        assert!(emit(&mut encoder, &rdata).is_ok());
+        assert!(rdata.emit(&mut encoder).is_ok());
         let bytes = encoder.into_bytes();
 
-        println!("bytes: {:?}", bytes);
+        println!("bytes: {bytes:?}");
 
         let mut decoder: BinDecoder<'_> = BinDecoder::new(bytes);
 
-        let read_rdata = read(&mut decoder).expect("Decoding error");
+        let read_rdata = SRV::read(&mut decoder).expect("Decoding error");
         assert_eq!(rdata, read_rdata);
     }
 }

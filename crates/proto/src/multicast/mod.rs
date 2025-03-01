@@ -1,17 +1,21 @@
 // Copyright 2015-2018 Benjamin Fry <benjaminfry@me.com>
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
 //! Multicast protocol related components for DNS
 
+#[cfg(feature = "tokio")]
 mod mdns_client_stream;
+#[cfg(feature = "tokio")]
 mod mdns_stream;
 
+#[cfg(feature = "tokio")]
 pub use self::mdns_client_stream::{MdnsClientConnect, MdnsClientStream};
-pub use self::mdns_stream::{MdnsStream, MDNS_IPV4, MDNS_IPV6};
+#[cfg(feature = "tokio")]
+pub use self::mdns_stream::{MDNS_IPV4, MDNS_IPV6, MdnsStream};
 
 /// See [rfc6762](https://tools.ietf.org/html/rfc6762#section-5) details on these different types.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,25 +48,25 @@ impl MdnsQueryType {
     /// This will be sending packets, i.e. a standard UDP socket will be created
     pub fn sender(self) -> bool {
         match self {
-            MdnsQueryType::Passive => false,
-            MdnsQueryType::OneShot | MdnsQueryType::OneShotJoin => true,
-            MdnsQueryType::Continuous => true,
+            Self::Passive => false,
+            Self::OneShot | Self::OneShotJoin => true,
+            Self::Continuous => true,
         }
     }
 
     /// Returns true if this process can bind to *:5353
     pub fn bind_on_5353(self) -> bool {
         match self {
-            MdnsQueryType::OneShot | MdnsQueryType::OneShotJoin | MdnsQueryType::Passive => false,
-            MdnsQueryType::Continuous => true,
+            Self::OneShot | Self::OneShotJoin | Self::Passive => false,
+            Self::Continuous => true,
         }
     }
 
     /// Returns true if this mDNS client should join, listen, on the multicast address
     pub fn join_multicast(self) -> bool {
         match self {
-            MdnsQueryType::OneShot => false,
-            MdnsQueryType::Continuous | MdnsQueryType::OneShotJoin | MdnsQueryType::Passive => true,
+            Self::OneShot => false,
+            Self::Continuous | Self::OneShotJoin | Self::Passive => true,
         }
     }
 }

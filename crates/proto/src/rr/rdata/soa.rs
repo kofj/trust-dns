@@ -1,29 +1,22 @@
-/*
- * Copyright (C) 2015 Benjamin Fry <benjaminfry@me.com>
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright 2015-2023 Benjamin Fry <benjaminfry@me.com>
+//
+// Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
+// copied, modified, or distributed except according to those terms.
 
 //! start of authority record defining ownership and defaults for the zone
 
-use std::fmt;
+use core::fmt;
 
-#[cfg(feature = "serde-config")]
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use crate::error::*;
-use crate::rr::domain::Name;
-use crate::serialize::binary::*;
+use crate::{
+    error::ProtoResult,
+    rr::{RData, RecordData, RecordType, domain::Name},
+    serialize::binary::{BinDecodable, BinDecoder, BinEncodable, BinEncoder},
+};
 
 /// [RFC 1035, DOMAIN NAMES - IMPLEMENTATION AND SPECIFICATION, November 1987](https://tools.ietf.org/html/rfc1035)
 ///
@@ -66,10 +59,10 @@ use crate::serialize::binary::*;
 /// bound on the TTL field for all RRs in a zone.  Note that this use of
 /// MINIMUM should occur when the RRs are copied into the response and not
 /// when the zone is loaded from a Zone File or via a zone transfer.  The
-/// reason for this provison is to allow future dynamic update facilities to
+/// reason for this provision is to allow future dynamic update facilities to
 /// change the SOA RR with known semantics.
 /// ```
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct SOA {
     mname: Name,
@@ -215,48 +208,78 @@ impl SOA {
     }
 }
 
-/// Read the RData from the given Decoder
-pub fn read(decoder: &mut BinDecoder<'_>) -> ProtoResult<SOA> {
-    Ok(SOA {
-        mname: Name::read(decoder)?,
-        rname: Name::read(decoder)?,
-        serial: decoder.read_u32()?.unverified(/*any u32 is valid*/),
-        refresh: decoder.read_i32()?.unverified(/*any i32 is valid*/),
-        retry: decoder.read_i32()?.unverified(/*any i32 is valid*/),
-        expire: decoder.read_i32()?.unverified(/*any i32 is valid*/),
-        minimum: decoder.read_u32()?.unverified(/*any u32 is valid*/),
-    })
+impl BinEncodable for SOA {
+    /// [RFC 4034](https://tools.ietf.org/html/rfc4034#section-6), DNSSEC Resource Records, March 2005
+    ///
+    /// This is accurate for all currently known name records.
+    ///
+    /// ```text
+    /// 6.2.  Canonical RR Form
+    ///
+    ///    For the purposes of DNS security, the canonical form of an RR is the
+    ///    wire format of the RR where:
+    ///
+    ///    ...
+    ///
+    ///    3.  if the type of the RR is NS, MD, MF, CNAME, SOA, MB, MG, MR, PTR,
+    ///        HINFO, MINFO, MX, HINFO, RP, AFSDB, RT, SIG, PX, NXT, NAPTR, KX,
+    ///        SRV, DNAME, A6, RRSIG, or (rfc6840 removes NSEC), all uppercase
+    ///        US-ASCII letters in the DNS names contained within the RDATA are replaced
+    ///        by the corresponding lowercase US-ASCII letters;
+    /// ```
+    fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
+        let is_canonical_names = encoder.is_canonical_names();
+
+        // to_lowercase for rfc4034 and rfc6840
+        self.mname
+            .emit_with_lowercase(encoder, is_canonical_names)?;
+        self.rname
+            .emit_with_lowercase(encoder, is_canonical_names)?;
+        encoder.emit_u32(self.serial)?;
+        encoder.emit_i32(self.refresh)?;
+        encoder.emit_i32(self.retry)?;
+        encoder.emit_i32(self.expire)?;
+        encoder.emit_u32(self.minimum)?;
+        Ok(())
+    }
 }
 
-/// [RFC 4034](https://tools.ietf.org/html/rfc4034#section-6), DNSSEC Resource Records, March 2005
-///
-/// This is accurate for all currently known name records.
-///
-/// ```text
-/// 6.2.  Canonical RR Form
-///
-///    For the purposes of DNS security, the canonical form of an RR is the
-///    wire format of the RR where:
-///
-///    ...
-///
-///    3.  if the type of the RR is NS, MD, MF, CNAME, SOA, MB, MG, MR, PTR,
-///        HINFO, MINFO, MX, HINFO, RP, AFSDB, RT, SIG, PX, NXT, NAPTR, KX,
-///        SRV, DNAME, A6, RRSIG, or (rfc6840 removes NSEC), all uppercase
-///        US-ASCII letters in the DNS names contained within the RDATA are replaced
-///        by the corresponding lowercase US-ASCII letters;
-/// ```
-pub fn emit(encoder: &mut BinEncoder<'_>, soa: &SOA) -> ProtoResult<()> {
-    let is_canonical_names = encoder.is_canonical_names();
+impl<'r> BinDecodable<'r> for SOA {
+    fn read(decoder: &mut BinDecoder<'r>) -> ProtoResult<Self> {
+        Ok(Self {
+            mname: Name::read(decoder)?,
+            rname: Name::read(decoder)?,
+            serial: decoder.read_u32()?.unverified(/*any u32 is valid*/),
+            refresh: decoder.read_i32()?.unverified(/*any i32 is valid*/),
+            retry: decoder.read_i32()?.unverified(/*any i32 is valid*/),
+            expire: decoder.read_i32()?.unverified(/*any i32 is valid*/),
+            minimum: decoder.read_u32()?.unverified(/*any u32 is valid*/),
+        })
+    }
+}
 
-    soa.mname.emit_with_lowercase(encoder, is_canonical_names)?;
-    soa.rname.emit_with_lowercase(encoder, is_canonical_names)?;
-    encoder.emit_u32(soa.serial)?;
-    encoder.emit_i32(soa.refresh)?;
-    encoder.emit_i32(soa.retry)?;
-    encoder.emit_i32(soa.expire)?;
-    encoder.emit_u32(soa.minimum)?;
-    Ok(())
+impl RecordData for SOA {
+    fn try_from_rdata(data: RData) -> Result<Self, RData> {
+        match data {
+            RData::SOA(soa) => Ok(soa),
+            _ => Err(data),
+        }
+    }
+
+    fn try_borrow(data: &RData) -> Option<&Self> {
+        match data {
+            RData::SOA(soa) => Some(soa),
+            _ => None,
+        }
+    }
+
+    fn record_type(&self) -> RecordType {
+        RecordType::SOA
+    }
+
+    fn into_rdata(self) -> RData {
+        RData::SOA(self)
+    }
 }
 
 /// [RFC 1033](https://tools.ietf.org/html/rfc1033), DOMAIN OPERATIONS GUIDE, November 1987
@@ -332,15 +355,20 @@ impl fmt::Display for SOA {
 mod tests {
     #![allow(clippy::dbg_macro, clippy::print_stdout)]
 
+    use alloc::vec::Vec;
+    use std::println;
+
+    use crate::{rr::RecordDataDecodable, serialize::binary::Restrict};
+
     use super::*;
 
     #[test]
     fn test() {
-        use std::str::FromStr;
+        use core::str::FromStr;
 
         let rdata = SOA::new(
-            Name::from_str("m.example.com").unwrap(),
-            Name::from_str("r.example.com").unwrap(),
+            Name::from_str("m.example.com.").unwrap(),
+            Name::from_str("r.example.com.").unwrap(),
             1,
             2,
             3,
@@ -350,13 +378,14 @@ mod tests {
 
         let mut bytes = Vec::new();
         let mut encoder: BinEncoder<'_> = BinEncoder::new(&mut bytes);
-        assert!(emit(&mut encoder, &rdata).is_ok());
+        assert!(rdata.emit(&mut encoder).is_ok());
         let bytes = encoder.into_bytes();
+        let len = bytes.len() as u16;
 
-        println!("bytes: {:?}", bytes);
+        println!("bytes: {bytes:?}");
 
         let mut decoder: BinDecoder<'_> = BinDecoder::new(bytes);
-        let read_rdata = read(&mut decoder).expect("Decoding error");
+        let read_rdata = SOA::read_data(&mut decoder, Restrict::new(len)).expect("Decoding error");
         assert_eq!(rdata, read_rdata);
     }
 }

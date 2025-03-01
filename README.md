@@ -1,26 +1,33 @@
-[![minimum rustc: 1.54](https://img.shields.io/badge/minimum%20rustc-1.54-green?logo=rust)](https://www.whatrustisit.com)
-[![Build Status](https://github.com/bluejekyll/trust-dns/workflows/test/badge.svg?branch=main)](https://github.com/bluejekyll/trust-dns/actions?query=workflow%3Atest)
-[![codecov](https://codecov.io/gh/bluejekyll/trust-dns/branch/main/graph/badge.svg)](https://codecov.io/gh/bluejekyll/trust-dns)
+[![minimum rustc: 1.70](https://img.shields.io/badge/minimum%20rustc-1.70-green?logo=rust)](https://www.whatrustisit.com)
+[![Build Status](https://github.com/hickory-dns/hickory-dns/workflows/test/badge.svg?branch=main)](https://github.com/hickory-dns/hickory-dns/actions?query=workflow%3Atest)
+[![codecov](https://codecov.io/gh/hickory-dns/hickory-dns/branch/main/graph/badge.svg)](https://codecov.io/gh/hickory-dns/hickory-dns)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE-MIT)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache_2.0-blue.svg)](LICENSE-APACHE)
 [![Discord](https://img.shields.io/discord/590067103822774272.svg)](https://discord.gg/89nxE4n)
 
-![Trust-DNS](logo.svg)
+<div class="oranda-hide">
 
-# Trust-DNS
+![Hickory DNS](logo.png)
 
-A Rust based DNS client, server, and Resolver, built to be safe and secure from the
+# Hickory DNS
+
+</div>
+
+A Rust based DNS client, server, and resolver, built to be safe and secure from the
 ground up.
 
 This repo consists of multiple crates:
 
-| Library | Description |
-|---------|-------------|
-| **Trust-DNS** | [![](https://img.shields.io/crates/v/trust-dns.svg)](https://crates.io/crates/trust-dns) Binaries for running a DNS authoritative server. |
-| **Proto** | [![](https://img.shields.io/crates/v/trust-dns-proto.svg)](https://crates.io/crates/trust-dns-proto) [![trust-dns-proto](https://docs.rs/trust-dns-proto/badge.svg)](https://docs.rs/trust-dns-proto) Raw DNS library, exposes an unstable API and only for use by the other Trust-DNS libraries, not intended for end-user use. |
-| **Client** | [![](https://img.shields.io/crates/v/trust-dns-client.svg)](https://crates.io/crates/trust-dns-client) [![trust-dns-client](https://docs.rs/trust-dns-client/badge.svg)](https://docs.rs/trust-dns-client) Used for sending `query`, `update`, and `notify` messages directly to a DNS server. |
-| **Server** | [![](https://img.shields.io/crates/v/trust-dns-server.svg)](https://crates.io/crates/trust-dns-server) [![trust-dns-server](https://docs.rs/trust-dns-server/badge.svg)](https://docs.rs/trust-dns-server) Use to host DNS records, this also has a `named` binary for running in a daemon form. |
-| **Resolver** | [![](https://img.shields.io/crates/v/trust-dns-resolver.svg)](https://crates.io/crates/trust-dns-resolver) [![trust-dns-resolver](https://docs.rs/trust-dns-resolver/badge.svg)](https://docs.rs/trust-dns-resolver) Utilizes the client library to perform DNS resolution. Can be used in place of the standard OS resolution facilities. |
+| Library         | Description                                                                                                                                                                                                                                                                                                                      |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [**Hickory DNS**](bin/)             | [![](https://img.shields.io/crates/v/hickory-dns.svg)](https://crates.io/crates/hickory-dns) Provides the `hickory-dns` binary for running a DNS server.                                                                                                                                                                         |
+| [**Proto**](crates/proto/)          | [![](https://img.shields.io/crates/v/hickory-proto.svg)](https://crates.io/crates/hickory-proto) [![hickory-proto](https://docs.rs/hickory-proto/badge.svg)](https://docs.rs/hickory-proto) Low-level DNS library, including message encoding/decoding and DNS transports.                                                       |
+| [**Client**](crates/client/)        | [![](https://img.shields.io/crates/v/hickory-client.svg)](https://crates.io/crates/hickory-client) [![hickory-client](https://docs.rs/hickory-client/badge.svg)](https://docs.rs/hickory-client) Used for sending `query`, `update`, and `notify` messages directly to a DNS server.                                             |
+| [**Server**](crates/server/)        | [![](https://img.shields.io/crates/v/hickory-server.svg)](https://crates.io/crates/hickory-server) [![hickory-server](https://docs.rs/hickory-server/badge.svg)](https://docs.rs/hickory-server) Used to build DNS servers. The `hickory-dns` binary makes use of this library.                                                  |
+| [**Resolver**](crates/resolver/)    | [![](https://img.shields.io/crates/v/hickory-resolver.svg)](https://crates.io/crates/hickory-resolver) [![hickory-resolver](https://docs.rs/hickory-resolver/badge.svg)](https://docs.rs/hickory-resolver) Utilizes the client library to perform DNS resolution. Can be used in place of the standard OS resolution facilities. |
+| [**Recursor**](crates/recursor/)    | [![](https://img.shields.io/crates/v/hickory-recursor.svg)](https://crates.io/crates/hickory-recursor) [![hickory-recursor](https://docs.rs/hickory-recursor/badge.svg)](https://docs.rs/hickory-recursor) Performs recursive DNS resolution, looking up records from their authoritative name servers.                          |
+
+**NOTICE** This project was rebranded from Trust-DNS to Hickory DNS and has been moved to the https://github.com/hickory-dns/hickory-dns organization and repo.
 
 # Goals
 
@@ -34,78 +41,13 @@ This repo consists of multiple crates:
 
 # Status
 
-## Resolver
+## DNSSEC status
 
-The Trust-DNS Resolver is a native Rust implementation for stub resolution in Rust applications. The Resolver supports many common query patterns, all of which can be configured when creating the Resolver. It is capable of using system configuration on Unix and Windows. On Windows there is a known issue that relates to a large set of interfaces being registered for use, so might require ignoring the system configuration.
+The current root key is bundled into the system, and used by default. This gives
+validation of DNSKEY and DS records back to the root. NSEC and NSEC3 are
+implemented.
 
-The Resolver will properly follow CNAME chains as well as SRV record lookups. There is a long term plan to make the Resolver capable of fully recursive queries, but that's not currently possible.
-
-## Client
-
-The Trust-DNS Client is intended to be used for operating against a DNS server directly. It can be used for verifying records or updating records for servers that support SIG0 and dynamic update. The Client is also capable of validating DNSSEC. As of now NSEC3 validation is not yet supported, though NSEC is. There are two interfaces that can be used, the async/await compatible AsyncClient  and a blocking Client for ease of use. Today, Tokio is required for the executor Runtime.
-
-### Unique client side implementations
-
-These are standards supported by the DNS protocol. The client implements them
- as high level interfaces, which is a bit more rare.
-
-| Feature | Description |
-|---------|-------------|
-| [SyncDnssecClient](https://docs.rs/trust-dns/0.11.0/trust_dns/client/struct.SyncDnssecClient.html) | DNSSec validation |
-| [create](https://docs.rs/trust-dns/0.11.0/trust_dns/client/trait.Client.html#method.create) | atomic create of a record, with authenticated request |
-| [append](https://docs.rs/trust-dns/0.11.0/trust_dns/client/trait.Client.html#method.append) | verify existence of a record and append to it |
-| [compare_and_swap](https://docs.rs/trust-dns/0.11.0/trust_dns/client/trait.Client.html#method.compare_and_swap) | atomic (depends on server) compare and swap |
-| [delete_by_rdata](https://docs.rs/trust-dns/0.11.0/trust_dns/client/trait.Client.html#method.delete_by_rdata) | delete a specific record |
-| [delete_rrset](https://docs.rs/trust-dns/0.11.0/trust_dns/client/trait.Client.html#method.delete_rrset) | delete an entire record set |
-| [delete_all](https://docs.rs/trust-dns/0.11.0/trust_dns/client/trait.Client.html#method.delete_all) | delete all records sets with a given name |
-| [notify](https://docs.rs/trust-dns/0.11.0/trust_dns/client/trait.Client.html#method.notify) | notify server that it should reload a zone |
-
-## Server
-
-The server code is complete, the daemon supports IPv4 and IPv6, UDP and TCP.
- There currently is no way to limit TCP and AXFR operations, so it is still not
- recommended to put into production as TCP can be used to DOS the service.
- Zone file parsing is complete and supported. There is currently no forking
- option, and the server is not yet threaded (although it is implemented with
- async IO, so threading may not be a huge benefit). There is still a lot of work
- to do before a server can be trusted with this externally. Running it behind a
- firewall on a private network would be safe.
-
-Zone signing support is complete, to insert a key store a pem encoded rsa file
- in the same directory as the initial zone file with the `.key` suffix. *Note*:
- this must be only readable by the current user. If one is not present one will
- be created and written to the correct location. This also acts as the initial
- key for dynamic update SIG(0) validation. To get the public key, the `DNSKEY`
- record for the zone can be queried. This is needed to provide to other
- upstream servers to create the `DS` key. Dynamic DNS is also complete,
- if enabled, a journal file will be stored next to the zone file with the
- `jrnl` suffix. *Note*: if the key is changed or updated, it is currently the
- operators responsibility to remove the only public key from the zone, this
- allows for the `DNSKEY` to exist for some unspecified period of time during
- key rotation. Rotating the key currently is not available online and requires
- a restart of the server process.
-
-### DNS-over-TLS and DNS-over-HTTPS on the Server
-
-Support of TLS on the Server is managed through a pkcs12 der file. The documentation is captured in the example test config file, [example.toml](https://github.com/bluejekyll/trust-dns/blob/main/tests/test-data/named_test_configs/example.toml). A registered certificate to the server can be pinned to the Client with the `add_ca()` method. Alternatively, as the client uses the rust-native-tls library, it should work with certificate signed by any standard CA.
-
-## DNS-over-TLS and DNS-over-HTTPS
-
-DoT and DoH are supported. This is accomplished through the use of one of `native-tls`, `openssl`, or `rustls` (only `rustls` is currently supported for DoH). The Resolver requires only requires valid DoT or DoH resolvers being registered in order to be used.
-
-To use with the `Client`, the `TlsClientConnection` or `HttpsClientConnection` should be used. Similarly, to use with the tokio `AsyncClient` the `TlsClientStream` or `HttpsClientStream` should be used. ClientAuth, mTLS, is currently not supported, there are some issues still being worked on. TLS is useful for Server authentication and connection privacy.
-
-To enable DoT one of the features `dns-over-native-tls`, `dns-over-openssl`, or `dns-over-rustls` must be enabled, `dns-over-https-rustls` is used for DoH.
-
-## DNSSec status
-
-Currently the root key is hardcoded into the system. This gives validation of
- DNSKEY and DS records back to the root. NSEC is implemented, but not NSEC3.
- Because caching is not yet enabled, it has been noticed that some DNS servers
- appear to rate limit the connections, validating RRSIG records back to the root
- can require a significant number of additional queries for those records.
-
-Zones will be automatically resigned on any record updates via dynamic DNS. To enable DNSSEC, one of the features `dnssec-openssl` or `dnssec-rustls` must be enabled.
+Zones will be automatically resigned on any record updates via dynamic DNS. To enable DNSSEC, enable the `dnssec-ring` feature.
 
 ## RFCs implemented
 
@@ -130,10 +72,12 @@ Zones will be automatically resigned on any record updates via dynamic DNS. To e
 
 ### Secure DNS operations
 
+- [RFC 2931](https://datatracker.ietf.org/doc/html/rfc2931): SIG(0)
 - [RFC 3007](https://tools.ietf.org/html/rfc3007): Secure Dynamic Update
 - [RFC 4034](https://tools.ietf.org/html/rfc4034): DNSSEC Resource Records
 - [RFC 4035](https://tools.ietf.org/html/rfc4035): Protocol Modifications for DNSSEC
 - [RFC 4509](https://tools.ietf.org/html/rfc4509): SHA-256 in DNSSEC Delegation Signer
+- [RFC 5155](https://tools.ietf.org/html/rfc5155): DNSSEC Hashed Authenticated Denial of Existence
 - [RFC 5702](https://tools.ietf.org/html/rfc5702): SHA-2 Algorithms with RSA in DNSKEY and RRSIG for DNSSEC
 - [RFC 6844](https://tools.ietf.org/html/rfc6844): DNS Certification Authority Authorization (CAA) Resource Record
 - [RFC 6698](https://tools.ietf.org/html/rfc6698): The DNS-Based Authentication of Named Entities (DANE) Transport Layer Security (TLS) Protocol: TLSA
@@ -159,125 +103,69 @@ Zones will be automatically resigned on any record updates via dynamic DNS. To e
 
 ### Secure DNS operations
 
-- [RFC 5155](https://tools.ietf.org/html/rfc5155): DNSSEC Hashed Authenticated Denial of Existence
 - [DNSCrypt](https://dnscrypt.org): Trusted DNS queries
 - [S/MIME](https://tools.ietf.org/html/draft-ietf-dane-smime-09): Domain Names For S/MIME
 
-# Usage
+## Minimum Rust Version
 
-This assumes that you have [Rust](https://www.rust-lang.org) stable installed. These
-presume that the trust-dns repos have already been synced to the local system:
-
-    git clone https://github.com/bluejekyll/trust-dns.git
-    cd trust-dns
-
-## Prerequisites
-
-### Minimum Rust Version
-
-- The current minimum rustc version for this project is `1.54`
-- OpenSSL development libraries (optional in client and resolver, min version 1.0.2)
-
-### Mac OS X: using homebrew
-
-```
-  brew install openssl
-  export OPENSSL_INCLUDE_DIR=`brew --prefix openssl`/include
-  export OPENSSL_LIB_DIR=`brew --prefix openssl`/lib
-```
-
-### Debian-based (includes Ubuntu & Raspbian): using apt-get
-
-```
-  # note for openssl that a minimum version of 1.0.2 is required for TLS, 
-  #  if this is an issue, TLS can be disabled (on the client), see below.
-  $ apt-get install openssl
-  $ apt-get install libssl-dev pkg-config
-```
+- The current minimum rustc version for this project is `1.70`
 
 ## Testing
 
-Trust-DNS uses `cargo-make` for build workflow management. While running `cargo test` at the project root will work, this is not exhaustive. Install `cargo-make` with `cargo install cargo-make`.
+Hickory DNS uses `just` for build workflow management. While running `cargo test` at the project root will work, this is not exhaustive. Install `just` with `cargo install just`. A few of the `just` recipes require [`cargo-workspaces`](https://github.com/pksunkara/cargo-workspaces) to be installed, a plugin to optimize the workflow around cargo workspaces. Install the plugin with `cargo install cargo-workspaces`.
 
 - Default tests
 
-    These are good for running on local systems. They will create sockets for
-    local tests, but will not attempt to access remote systems. Tests can also
-    be run from the crate directory, i.e. `client` or `server` and `cargo test`
+  These are good for running on local systems. They will create sockets for
+  local tests, but will not attempt to access remote systems. Tests can also
+  be run from the crate directory, i.e. `client` or `server` and `cargo test`
 
 ```shell
-cargo make
+just default
 ```
 
 - Default feature tests
 
-    Trust-DNS has many features, to quickly test with them or without, there are three targets supported, `default`, `no-default-features`, `all-features`:
+  Hickory DNS has many features, to quickly test with them or without, there are three targets supported, `default`, `no-default-features`, `all-features`:
 
 ```shell
-cargo make all-features
+just all-features
 ```
 
 - Individual feature tests
 
-    Trust-DNS has many features, each individual feature can be tested in dependently, see individual crates for all their features, here is a not necessarily up to date list: `dns-over-rustls`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-dnssec-openssl`, `dns-dnssec-openssl`, `dns-dnssec-ring`, `mdns`. Each feature can be tested with itself as the task target for `cargo-make`:
+  Hickory DNS has many features, each individual feature can be tested
+  independently. See individual crates for all their features, here is a not
+  necessarily up to date list: `dns-over-rustls`, `dns-over-https-rustls`,
+  `dns-over-native-tls`, `dns-over-openssl`, `dns-dnssec-openssl`,
+  `dns-dnssec-openssl`, `dns-dnssec-ring`, `mdns`. Each feature can be tested
+  with itself as the task target for `just`:
 
 ```shell
-cargo make dns-over-https-rustls
+just dns-over-https-rustls
 ```
 
 - Benchmarks
 
-    Waiting on benchmarks to stabilize in mainline Rust.
+  Waiting on benchmarks to stabilize in mainline Rust.
 
 ## Building
 
-- Production build, from the `trust-dns` base dir, to get all features, just pass the `--all-features` flag.
+- Production build, from the `hickory-dns` base dir, to get all features, just pass the `--all-features` flag.
 
 ```shell
-cargo build --release -p trust-dns
+cargo build --release -p hickory-dns
 ```
 
-## Running
-
-Warning: Trust-DNS is still under development, running in production is not
-recommended. The server is currently only single-threaded, it is non-blocking
-so this should allow it to work with most internal loads.
-
-- Verify the version
-
-```shell
-./target/release/named --version
-```
-
-- Get help
-
-```shell
-./target/release/named --help
-```
-
-- Launch `named` server with test config
-
-You may want not passing the `-p` parameter will run on default DNS ports. For the tls features, there are also port options for those, see `trust-dns --help`
-
-```shell
-./target/release/named -c ./tests/test-data/named_test_configs/example.toml -z ./tests/test-data/named_test_configs/ -p 24141
-```
-
-- Query the just launched server with `dig`
-
-```shell
-dig @127.0.0.1 -p 24141 www.example.com
-```
-
-## Using the trust-dns-resolver CLI
+## Using the hickory-resolver CLI
 
 Available in `0.20`
 
 ```shell
-cargo install --bin resolve trust-dns-util
+cargo install --bin resolve hickory-util
 ```
 
-Or from source, in the trust-dns directory
+Or from source, in the hickory-dns directory
 
 ```shell
 cargo install --bin resolve --path util
@@ -289,56 +177,26 @@ example:
 $ resolve www.example.com.
 Querying for www.example.com. A from udp:8.8.8.8:53, tcp:8.8.8.8:53, udp:8.8.4.4:53, tcp:8.8.4.4:53, udp:[2001:4860:4860::8888]:53, tcp:[2001:4860:4860::8888]:53, udp:[2001:4860:4860::8844]:53, tcp:[2001:4860:4860::8844]:53
 Success for query name: www.example.com. type: A class: IN
-        www.example.com. 21063 IN A 93.184.216.34
-```
-
-## Using as a dependency and custom features
-
-The Client has a few features which can be disabled for different reasons when embedding in other software.
-
-- `dnssec-openssl`
-    It is a default feature, so default-features will need to be set to false (this will disable all other default features in trust-dns). Until there are other crypto libraries supported, this will also disable DNSSec validation. The functions will still exist, but will always return errors on validation. The below example line will disable all default features and enable OpenSSL, remove `"openssl"` to remove the dependency on OpenSSL.
-
-- `dnssec-ring`
-    Ring support can be used for RSA and ED25519 DNSSec validation.
-
-- `dns-over-native-tls`
-    Uses `native-tls` for DNS-over-TLS implementation, only supported in client and resolver, not server.
-
-- `dns-over-openssl`
-    Uses `openssl` for DNS-over-TLS implementation supported in server and client, resolver does not have default CA chains.
-
-- `dns-over-rustls`
-    Uses `rustls` for DNS-over-TLS implementation, only supported in client and resolver, not server. This is the best option where a pure Rust toolchain is desired. Supported in client, resolver, and server.
-
-- `dns-over-https-rustls`
-    Uses `rustls` for DNS-over-HTTPS (and DNS-over-TLS will be enabled) implementation, only supported in client, resolver, and server. This is the best option where a pure Rust toolchain is desired.
-
-- `mdns` *EXPERIMENTAL*
-    Enables the experimental mDNS features as well as DNS-SD. This currently has known issues.
-
-Using custom features in dependencies:
-
-```
-[dependencies]
-  ...
-trust-dns = { version = "*", default-features = false, features = ["dnssec-openssl"] }
-```
-
-Using custom features during build:
-
-```console
-$> cargo build --release --features dns-over-rustls
-...
+        www.example.com. 21063 IN A 93.184.215.14
 ```
 
 ## FAQ
 
 - Why are you building another DNS server?
 
-    Because of all the security advisories out there for BIND.
-Using Rust semantics it should be possible to develop a high performance and
-safe DNS Server that is more resilient to attacks.
+      Because of all the security advisories out there for BIND.
+
+  Using Rust semantics it should be possible to develop a high performance and
+  safe DNS Server that is more resilient to attacks.
+
+- What is the MSRV (minimum stable Rust version) policy?
+
+      Hickory DNS will work to support backward compatibility with three Rust versions.
+
+  For example, if `1.50` is the current release, then the MSRV will be `1.47`. The
+  version is only increased as necessary, so it's possible that the MSRV is older
+  than this policy states. Additionally, the MSRV is only supported for the `no-default-features`
+  build due to it being an intractable issue of trying to enforce this policy on dependencies.
 
 ## Community
 

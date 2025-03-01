@@ -1,38 +1,35 @@
 // Copyright 2015-2021 Benjamin Fry <benjaminfry@me.com>
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-//! All authority related types
+//! File-backed authority
 
 use std::{
     collections::BTreeMap,
-    fs::File,
-    io::{BufRead, BufReader},
+    fs,
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
 };
 
-use log::{debug, info};
+use tracing::{debug, info};
 
-#[cfg(feature = "dnssec")]
 use crate::{
-    authority::DnssecAuthority,
-    client::{
-        proto::rr::dnssec::rdata::key::KEY,
-        rr::dnssec::{DnsSecResult, SigSigner},
+    authority::{
+        Authority, LookupControlFlow, LookupOptions, MessageRequest, UpdateResult, ZoneType,
     },
-};
-use crate::{
-    authority::{Authority, LookupError, LookupOptions, MessageRequest, UpdateResult, ZoneType},
-    client::{
-        rr::{LowerName, Name, RecordSet, RecordType, RrKey},
-        serialize::txt::{Lexer, Parser, Token},
-    },
+    proto::rr::{LowerName, Name, RecordSet, RecordType, RrKey},
+    proto::serialize::txt::Parser,
     server::RequestInfo,
     store::{file::FileConfig, in_memory::InMemoryAuthority},
+};
+#[cfg(feature = "__dnssec")]
+use crate::{
+    authority::{DnssecAuthority, Nsec3QueryInfo},
+    dnssec::NxProofKind,
+    proto::dnssec::{DnsSecResult, SigSigner, rdata::key::KEY},
 };
 
 /// FileAuthority is responsible for storing the resource records for a particular zone.
@@ -40,36 +37,6 @@ use crate::{
 /// Authorities default to DNSClass IN. The ZoneType specifies if this should be treated as the
 /// start of authority for the zone, is a Secondary, or a cached zone.
 pub struct FileAuthority(InMemoryAuthority);
-
-/// Max traversal depth for $INCLUDE files
-const MAX_INCLUDE_LEVEL: u16 = 256;
-
-/// Inner state of zone file loader, tracks depth of $INCLUDE
-/// loads as well as visited previously files, so the loader
-/// is able to abort e.g. when cycle is detected
-///
-/// Note, that tracking max depth level explicitly covers also
-/// cycles in $INCLUDEs. The error description in this case would
-/// not be very helpful to detect the root cause of the problem
-/// though. The way to improve diagnose experience would be to
-/// traverse $INCLUDE files in topologically sorted order which
-/// requires quite some re-arrangements in the code and in the
-/// way loader is currently implemented.
-struct FileReaderState {
-    level: u16,
-}
-
-impl FileReaderState {
-    fn new() -> Self {
-        Self { level: 0 }
-    }
-
-    fn next_level(&self) -> Self {
-        Self {
-            level: self.level + 1,
-        }
-    }
-}
 
 impl FileAuthority {
     /// Creates a new Authority.
@@ -80,9 +47,8 @@ impl FileAuthority {
     ///              record.
     /// * `records` - The map of the initial set of records in the zone.
     /// * `zone_type` - The type of zone, i.e. is this authoritative?
-    /// * `allow_update` - If true, then this zone accepts dynamic updates.
-    /// * `is_dnssec_enabled` - If true, then the zone will sign the zone with all registered keys,
-    ///                         (see `add_zone_signing_key()`)
+    /// * `allow_axfr` - Whether AXFR is allowed.
+    /// * `nx_proof_kind` - The kind of non-existence proof to be used by the server.
     ///
     /// # Return value
     ///
@@ -92,87 +58,17 @@ impl FileAuthority {
         records: BTreeMap<RrKey, RecordSet>,
         zone_type: ZoneType,
         allow_axfr: bool,
+        #[cfg(feature = "__dnssec")] nx_proof_kind: Option<NxProofKind>,
     ) -> Result<Self, String> {
-        InMemoryAuthority::new(origin, records, zone_type, allow_axfr).map(Self)
-    }
-
-    /// Read given file line by line and recursively invokes reader for
-    /// $INCLUDE directives
-    ///
-    /// TODO: it looks hacky as far we effectively duplicate parser's functionallity
-    /// (at least partially) and performing lexing twice.
-    /// Better solution requires us to change lexer to deal
-    /// with Lines-like iterator instead of String buf (or capability to combine a few
-    /// lexer instances into a single lexer).
-    ///
-    /// TODO: $INCLUDE could specify domain name -- to support on-flight swap for Origin
-    /// value we definitely need to rethink and rework loader/parser/lexer
-    fn read_file(
-        zone_path: PathBuf,
-        buf: &mut String,
-        state: FileReaderState,
-    ) -> Result<(), String> {
-        let file = File::open(&zone_path)
-            .map_err(|e| format!("failed to read {}: {:?}", zone_path.display(), e))?;
-        let reader = BufReader::new(file);
-        for line in reader.lines() {
-            let content = line.unwrap();
-            let mut lexer = Lexer::new(&content);
-
-            match (lexer.next_token(), lexer.next_token(), lexer.next_token()) {
-                (
-                    Ok(Some(Token::Include)),
-                    Ok(Some(Token::CharData(include_path))),
-                    Ok(Some(Token::CharData(_domain))),
-                ) => {
-                    return Err(format!(
-                        "Domain name for $INCLUDE is not supported at {}, trying to include {}",
-                        zone_path.display(),
-                        include_path
-                    ));
-                }
-                (Ok(Some(Token::Include)), Ok(Some(Token::CharData(include_path))), _) => {
-                    // RFC1035 (section 5) does not specify how filename for $INCLUDE
-                    // should be resolved into file path. The underlying code implements the
-                    // following:
-                    // * if the path is absolute (relies on Path::is_absolute), it uses normalized path
-                    // * otherwise, it joins the path with parent root of the current file
-                    //
-                    // TODO: Inlining files specified using non-relative path might potentially introduce
-                    // security issue in some cases (e.g. when working with zone files from untrusted sources)
-                    // and should probably be configurable by user.
-                    let include_path = Path::new(&include_path);
-                    let include_zone_path = if include_path.is_absolute() {
-                        include_path.to_path_buf()
-                    } else {
-                        let parent_dir =
-                            zone_path.parent().expect("file has to have parent folder");
-                        parent_dir.join(include_path)
-                    };
-
-                    if state.level >= MAX_INCLUDE_LEVEL {
-                        return Err(format!("Max depth level for nested $INCLUDE is reached at {}, trying to include {}", zone_path.display(), include_zone_path.display()));
-                    }
-
-                    let mut include_buf = String::new();
-
-                    info!(
-                        "including file {} into {}",
-                        include_zone_path.display(),
-                        zone_path.display()
-                    );
-
-                    Self::read_file(include_zone_path, &mut include_buf, state.next_level())?;
-                    buf.push_str(&include_buf);
-                }
-                _ => {
-                    buf.push_str(&content);
-                }
-            }
-
-            buf.push('\n');
-        }
-        Ok(())
+        InMemoryAuthority::new(
+            origin,
+            records,
+            zone_type,
+            allow_axfr,
+            #[cfg(feature = "__dnssec")]
+            nx_proof_kind,
+        )
+        .map(Self)
     }
 
     /// Read the Authority for the origin from the specified configuration
@@ -182,23 +78,32 @@ impl FileAuthority {
         allow_axfr: bool,
         root_dir: Option<&Path>,
         config: &FileConfig,
+        #[cfg(feature = "__dnssec")] nx_proof_kind: Option<NxProofKind>,
     ) -> Result<Self, String> {
-        let root_dir_path = root_dir.map(PathBuf::from).unwrap_or_else(PathBuf::new);
+        let root_dir_path = root_dir.map(PathBuf::from).unwrap_or_default();
         let zone_path = root_dir_path.join(&config.zone_file_path);
 
         info!("loading zone file: {:?}", zone_path);
 
-        let mut buf = String::new();
-
         // TODO: this should really use something to read line by line or some other method to
         //  keep the usage down. and be a custom lexer...
-        Self::read_file(zone_path, &mut buf, FileReaderState::new())
-            .map_err(|e| format!("failed to read {}: {:?}", &config.zone_file_path, e))?;
+        let buf = fs::read_to_string(&zone_path).map_err(|e| {
+            format!(
+                "failed to read {}: {:?}",
+                config.zone_file_path.display(),
+                e
+            )
+        })?;
 
-        let lexer = Lexer::new(&buf);
-        let (origin, records) = Parser::new()
-            .parse(lexer, Some(origin), None)
-            .map_err(|e| format!("failed to parse {}: {:?}", config.zone_file_path, e))?;
+        let (origin, records) = Parser::new(buf, Some(zone_path), Some(origin))
+            .parse()
+            .map_err(|e| {
+                format!(
+                    "failed to parse {}: {:?}",
+                    config.zone_file_path.display(),
+                    e
+                )
+            })?;
 
         info!(
             "zone file loaded: {} with {} records",
@@ -207,7 +112,14 @@ impl FileAuthority {
         );
         debug!("zone: {:#?}", records);
 
-        Self::new(origin, records, zone_type, allow_axfr)
+        Self::new(
+            origin,
+            records,
+            zone_type,
+            allow_axfr,
+            #[cfg(feature = "__dnssec")]
+            nx_proof_kind,
+        )
     }
 
     /// Unwrap the InMemoryAuthority
@@ -255,26 +167,27 @@ impl Authority for FileAuthority {
         self.0.origin()
     }
 
-    /// Looks up all Resource Records matching the giving `Name` and `RecordType`.
+    /// Looks up all Resource Records matching the given `Name` and `RecordType`.
     ///
     /// # Arguments
     ///
-    /// * `name` - The `Name`, label, to lookup.
-    /// * `rtype` - The `RecordType`, to lookup. `RecordType::ANY` will return all records matching
+    /// * `name` - The name to look up.
+    /// * `rtype` - The `RecordType` to look up. `RecordType::ANY` will return all records matching
     ///             `name`. `RecordType::AXFR` will return all record types except `RecordType::SOA`
     ///             due to the requirements that on zone transfers the `RecordType::SOA` must both
     ///             precede and follow all other records.
-    /// * `is_secure` - If the DO bit is set on the EDNS OPT record, then return RRSIGs as well.
+    /// * `lookup_options` - Query-related lookup options (e.g., DNSSEC DO bit, supported hash
+    ///                      algorithms, etc.)
     ///
     /// # Return value
     ///
-    /// None if there are no matching records, otherwise a `Vec` containing the found records.
+    /// A LookupControlFlow containing the lookup that should be returned to the client.
     async fn lookup(
         &self,
         name: &LowerName,
         rtype: RecordType,
         lookup_options: LookupOptions,
-    ) -> Result<Self::Lookup, LookupError> {
+    ) -> LookupControlFlow<Self::Lookup> {
         self.0.lookup(name, rtype, lookup_options).await
     }
 
@@ -282,23 +195,23 @@ impl Authority for FileAuthority {
     ///
     /// # Arguments
     ///
-    /// * `query` - the query to perform the lookup with.
-    /// * `is_secure` - if true, then RRSIG records (if this is a secure zone) will be returned.
+    /// * `request_info` - the query to perform the lookup with.
+    /// * `lookup_options` - Query-related lookup options (e.g., DNSSEC DO bit, supported hash
+    ///                      algorithms, etc.)
     ///
     /// # Return value
     ///
-    /// Returns a vectory containing the results of the query, it will be empty if not found. If
-    ///  `is_secure` is true, in the case of no records found then NSEC records will be returned.
+    /// A LookupControlFlow containing the lookup that should be returned to the client.
     async fn search(
         &self,
         request_info: RequestInfo<'_>,
         lookup_options: LookupOptions,
-    ) -> Result<Self::Lookup, LookupError> {
+    ) -> LookupControlFlow<Self::Lookup> {
         self.0.search(request_info, lookup_options).await
     }
 
     /// Get the NS, NameServer, record for the zone
-    async fn ns(&self, lookup_options: LookupOptions) -> Result<Self::Lookup, LookupError> {
+    async fn ns(&self, lookup_options: LookupOptions) -> LookupControlFlow<Self::Lookup> {
         self.0.ns(lookup_options).await
     }
 
@@ -308,31 +221,45 @@ impl Authority for FileAuthority {
     ///
     /// * `name` - given this name (i.e. the lookup name), return the NSEC record that is less than
     ///            this
-    /// * `is_secure` - if true then it will return RRSIG records as well
+    /// * `lookup_options` - Query-related lookup options (e.g., DNSSEC DO bit, supported hash
+    ///                      algorithms, etc.)
     async fn get_nsec_records(
         &self,
         name: &LowerName,
         lookup_options: LookupOptions,
-    ) -> Result<Self::Lookup, LookupError> {
+    ) -> LookupControlFlow<Self::Lookup> {
         self.0.get_nsec_records(name, lookup_options).await
+    }
+
+    #[cfg(feature = "__dnssec")]
+    async fn get_nsec3_records(
+        &self,
+        info: Nsec3QueryInfo<'_>,
+        lookup_options: LookupOptions,
+    ) -> LookupControlFlow<Self::Lookup> {
+        self.0.get_nsec3_records(info, lookup_options).await
     }
 
     /// Returns the SOA of the authority.
     ///
     /// *Note*: This will only return the SOA, if this is fulfilling a request, a standard lookup
     ///  should be used, see `soa_secure()`, which will optionally return RRSIGs.
-    async fn soa(&self) -> Result<Self::Lookup, LookupError> {
+    async fn soa(&self) -> LookupControlFlow<Self::Lookup> {
         self.0.soa().await
     }
 
     /// Returns the SOA record for the zone
-    async fn soa_secure(&self, lookup_options: LookupOptions) -> Result<Self::Lookup, LookupError> {
+    async fn soa_secure(&self, lookup_options: LookupOptions) -> LookupControlFlow<Self::Lookup> {
         self.0.soa_secure(lookup_options).await
+    }
+
+    #[cfg(feature = "__dnssec")]
+    fn nx_proof_kind(&self) -> Option<&NxProofKind> {
+        self.0.nx_proof_kind()
     }
 }
 
-#[cfg(feature = "dnssec")]
-#[cfg_attr(docsrs, doc(cfg(feature = "dnssec")))]
+#[cfg(feature = "__dnssec")]
 #[async_trait::async_trait]
 impl DnssecAuthority for FileAuthority {
     /// Add a (Sig0) key that is authorized to perform updates against this authority
@@ -353,25 +280,28 @@ impl DnssecAuthority for FileAuthority {
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
     use std::str::FromStr;
 
-    use crate::client::rr::RData;
+    use crate::proto::rr::{RData, rdata::A};
     use futures_executor::block_on;
+    use test_support::subscribe;
 
     use super::*;
     use crate::authority::ZoneType;
 
     #[test]
     fn test_load_zone() {
-        #[cfg(feature = "dnssec")]
+        subscribe();
+
+        #[cfg(feature = "__dnssec")]
         let config = FileConfig {
-            zone_file_path: "../../tests/test-data/named_test_configs/dnssec/example.com.zone"
-                .to_string(),
+            zone_file_path: PathBuf::from(
+                "../../tests/test-data/test_configs/dnssec/example.com.zone",
+            ),
         };
-        #[cfg(not(feature = "dnssec"))]
+        #[cfg(not(feature = "__dnssec"))]
         let config = FileConfig {
-            zone_file_path: "../../tests/test-data/named_test_configs/example.com.zone".to_string(),
+            zone_file_path: PathBuf::from("../../tests/test-data/test_configs/example.com.zone"),
         };
         let authority = FileAuthority::try_from_config(
             Name::from_str("example.com.").unwrap(),
@@ -379,6 +309,8 @@ mod tests {
             false,
             None,
             &config,
+            #[cfg(feature = "__dnssec")]
+            Some(NxProofKind::Nsec),
         )
         .expect("failed to load file");
 
@@ -393,10 +325,10 @@ mod tests {
         match lookup
             .into_iter()
             .next()
-            .expect("A record not found in authity")
+            .expect("A record not found in authority")
             .data()
         {
-            Some(RData::A(ip)) => assert_eq!(Ipv4Addr::new(127, 0, 0, 1), *ip),
+            RData::A(ip) => assert_eq!(A::new(127, 0, 0, 1), *ip),
             _ => panic!("wrong rdata type returned"),
         }
 
@@ -411,10 +343,10 @@ mod tests {
         match include_lookup
             .into_iter()
             .next()
-            .expect("A record not found in authity")
+            .expect("A record not found in authority")
             .data()
         {
-            Some(RData::A(ip)) => assert_eq!(Ipv4Addr::new(127, 0, 0, 5), *ip),
+            RData::A(ip) => assert_eq!(A::new(127, 0, 0, 5), *ip),
             _ => panic!("wrong rdata type returned"),
         }
     }

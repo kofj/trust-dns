@@ -1,15 +1,18 @@
-// Copyright 2015-2021 Benjamin Fry <benjaminfry@me.com>
+// Copyright 2015-2023 Benjamin Fry <benjaminfry@me.com>
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
 //! Basic protocol message for DNS
 
-use std::{iter, mem, ops::Deref, sync::Arc};
+use alloc::{boxed::Box, fmt, vec::Vec};
+use core::{iter, mem, ops::Deref};
 
-use log::{debug, warn};
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+use tracing::{debug, warn};
 
 use crate::{
     error::*,
@@ -19,7 +22,7 @@ use crate::{
     xfer::DnsResponse,
 };
 
-/// The basic request and response datastructure, used for all DNS protocols.
+/// The basic request and response data structure, used for all DNS protocols.
 ///
 /// [RFC 1035, DOMAIN NAMES - IMPLEMENTATION AND SPECIFICATION, November 1987](https://tools.ietf.org/html/rfc1035)
 ///
@@ -61,7 +64,8 @@ use crate::{
 ///
 /// By default Message is a Query. Use the Message::as_update() to create and update, or
 ///  Message::new_update()
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 pub struct Message {
     header: Header,
     queries: Vec<Query>,
@@ -78,10 +82,10 @@ pub fn update_header_counts(
     is_truncated: bool,
     counts: HeaderCounts,
 ) -> Header {
-    assert!(counts.query_count <= u16::max_value() as usize);
-    assert!(counts.answer_count <= u16::max_value() as usize);
-    assert!(counts.nameserver_count <= u16::max_value() as usize);
-    assert!(counts.additional_count <= u16::max_value() as usize);
+    assert!(counts.query_count <= u16::MAX as usize);
+    assert!(counts.answer_count <= u16::MAX as usize);
+    assert!(counts.nameserver_count <= u16::MAX as usize);
+    assert!(counts.additional_count <= u16::MAX as usize);
 
     // TODO: should the function just take by value?
     let mut header = *current_header;
@@ -144,15 +148,32 @@ impl Message {
 
     /// Truncates a Message, this blindly removes all response fields and sets truncated to `true`
     pub fn truncate(&self) -> Self {
-        let mut truncated = self.clone();
-        truncated.set_truncated(true);
-        // drops additional/answer/queries so len is 0
-        truncated.take_additionals();
-        truncated.take_answers();
-        truncated.take_queries();
+        // copy header
+        let mut header = self.header;
+        header.set_truncated(true);
+        header
+            .set_additional_count(0)
+            .set_answer_count(0)
+            .set_name_server_count(0);
+
+        let mut msg = Self::new();
+        // drops additional/answer/nameservers/signature
+        // adds query/OPT
+        msg.add_queries(self.queries().iter().cloned());
+        if let Some(edns) = self.extensions().clone() {
+            msg.set_edns(edns);
+        }
+        // set header
+        msg.set_header(header);
 
         // TODO, perhaps just quickly add a few response records here? that we know would fit?
-        truncated
+        msg
+    }
+
+    /// Sets the `Header` with provided
+    pub fn set_header(&mut self, header: Header) -> &mut Self {
+        self.header = header;
+        self
     }
 
     /// see `Header::set_id`
@@ -212,6 +233,42 @@ impl Message {
     /// see `Header::set_response_code`
     pub fn set_response_code(&mut self, response_code: ResponseCode) -> &mut Self {
         self.header.set_response_code(response_code);
+        self
+    }
+
+    /// see `Header::set_query_count`
+    ///
+    /// this count will be ignored during serialization,
+    /// where the length of the associated records will be used instead.
+    pub fn set_query_count(&mut self, query_count: u16) -> &mut Self {
+        self.header.set_query_count(query_count);
+        self
+    }
+
+    /// see `Header::set_answer_count`
+    ///
+    /// this count will be ignored during serialization,
+    /// where the length of the associated records will be used instead.
+    pub fn set_answer_count(&mut self, answer_count: u16) -> &mut Self {
+        self.header.set_answer_count(answer_count);
+        self
+    }
+
+    /// see `Header::set_name_server_count`
+    ///
+    /// this count will be ignored during serialization,
+    /// where the length of the associated records will be used instead.
+    pub fn set_name_server_count(&mut self, name_server_count: u16) -> &mut Self {
+        self.header.set_name_server_count(name_server_count);
+        self
+    }
+
+    /// see `Header::set_additional_count`
+    ///
+    /// this count will be ignored during serialization,
+    /// where the length of the associated records will be used instead.
+    pub fn set_additional_count(&mut self, additional_count: u16) -> &mut Self {
+        self.header.set_additional_count(additional_count);
         self
     }
 
@@ -298,6 +355,19 @@ impl Message {
         self
     }
 
+    /// Add all the records from the iterator to the additionals section of the Message
+    pub fn add_additionals<R, I>(&mut self, records: R) -> &mut Self
+    where
+        R: IntoIterator<Item = Record, IntoIter = I>,
+        I: Iterator<Item = Record>,
+    {
+        for record in records {
+            self.add_additional(record);
+        }
+
+        self
+    }
+
     /// Sets the additional to the specified set of Records.
     ///
     /// # Panics
@@ -317,10 +387,9 @@ impl Message {
     /// Add a SIG0 record, i.e. sign this message
     ///
     /// This must be used only after all records have been associated. Generally this will be handled by the client and not need to be used directly
-    #[cfg(feature = "dnssec")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "dnssec")))]
+    #[cfg(feature = "__dnssec")]
     pub fn add_sig0(&mut self, record: Record) -> &mut Self {
-        assert_eq!(RecordType::SIG, record.rr_type());
+        assert_eq!(RecordType::SIG, record.record_type());
         self.signature.push(record);
         self
     }
@@ -328,10 +397,9 @@ impl Message {
     /// Add a TSIG record, i.e. authenticate this message
     ///
     /// This must be used only after all records have been associated. Generally this will be handled by the client and not need to be used directly
-    #[cfg(feature = "dnssec")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "dnssec")))]
+    #[cfg(feature = "__dnssec")]
     pub fn add_tsig(&mut self, record: Record) -> &mut Self {
-        assert_eq!(RecordType::TSIG, record.rr_type());
+        assert_eq!(RecordType::TSIG, record.record_type());
         self.signature.push(record);
         self
     }
@@ -392,6 +460,14 @@ impl Message {
     ///  record to create the EDNS `ResponseCode`
     pub fn response_code(&self) -> ResponseCode {
         self.header.response_code()
+    }
+
+    /// Returns the query from this Message.
+    ///
+    /// In almost all cases, a Message will only contain one query. This is a convenience function to get the single query.
+    /// See the alternative `queries*` methods for the raw set of queries in the Message
+    pub fn query(&self) -> Option<&Query> {
+        self.queries.first()
     }
 
     /// ```text
@@ -501,18 +577,31 @@ impl Message {
     /// ```
     /// # Return value
     ///
-    /// Returns the EDNS record if it was found in the additional section.
+    /// Optionally returns a reference to EDNS section
+    #[deprecated(note = "Please use `extensions()`")]
     pub fn edns(&self) -> Option<&Edns> {
         self.edns.as_ref()
     }
 
-    /// If edns is_none, this will create a new default Edns.
+    /// Optionally returns mutable reference to EDNS section
+    #[deprecated(
+        note = "Please use `extensions_mut()`. You can chain `.get_or_insert_with(Edns::new)` to recover original behavior of adding Edns if not present"
+    )]
     pub fn edns_mut(&mut self) -> &mut Edns {
         if self.edns.is_none() {
-            self.edns = Some(Edns::new());
+            self.set_edns(Edns::new());
         }
-
         self.edns.as_mut().unwrap()
+    }
+
+    /// Returns reference of Edns section
+    pub fn extensions(&self) -> &Option<Edns> {
+        &self.edns
+    }
+
+    /// Returns mutable reference of Edns section
+    pub fn extensions_mut(&mut self) -> &mut Option<Edns> {
+        &mut self.edns
     }
 
     /// # Return value
@@ -520,11 +609,7 @@ impl Message {
     /// the max payload value as it's defined in the EDNS section.
     pub fn max_payload(&self) -> u16 {
         let max_size = self.edns.as_ref().map_or(512, Edns::max_payload);
-        if max_size < 512 {
-            512
-        } else {
-            max_size
-        }
+        if max_size < 512 { 512 } else { max_size }
     }
 
     /// # Return value
@@ -609,7 +694,7 @@ impl Message {
     /// # Returns
     ///
     /// This returns a tuple of first standard Records, then a possibly associated Edns, and then finally any optionally associated SIG0 and TSIG records.
-    #[cfg_attr(not(feature = "dnssec"), allow(unused_mut))]
+    #[cfg_attr(not(feature = "__dnssec"), allow(unused_mut))]
     pub fn read_records(
         decoder: &mut BinDecoder<'_>,
         count: usize,
@@ -634,13 +719,13 @@ impl Message {
                 } // SIG0 must be last
                 records.push(record)
             } else {
-                match record.rr_type() {
-                    #[cfg(feature = "dnssec")]
+                match record.record_type() {
+                    #[cfg(feature = "__dnssec")]
                     RecordType::SIG => {
                         saw_sig0 = true;
                         sigs.push(record);
                     }
-                    #[cfg(feature = "dnssec")]
+                    #[cfg(feature = "__dnssec")]
                     RecordType::TSIG => {
                         if saw_sig0 {
                             return Err("sig0 must be final resource record".into());
@@ -694,9 +779,9 @@ impl Message {
     ///
     /// Subsequent to calling this, the Message should not change.
     #[allow(clippy::match_single_binding)]
-    pub fn finalize<MF: MessageFinalizer>(
+    pub fn finalize(
         &mut self,
-        finalizer: &MF,
+        finalizer: &dyn MessageFinalizer,
         inception_time: u32,
     ) -> ProtoResult<Option<MessageVerifier>> {
         debug!("finalizing message: {:?}", self);
@@ -705,11 +790,11 @@ impl Message {
 
         // append all records to message
         for fin in finals {
-            match fin.rr_type() {
+            match fin.record_type() {
                 // SIG0's are special, and come at the very end of the message
-                #[cfg(feature = "dnssec")]
+                #[cfg(feature = "__dnssec")]
                 RecordType::SIG => self.add_sig0(fin),
-                #[cfg(feature = "dnssec")]
+                #[cfg(feature = "__dnssec")]
                 RecordType::TSIG => self.add_tsig(fin),
                 _ => self.add_additional(fin),
             };
@@ -727,12 +812,12 @@ impl Message {
 /// Consumes `Message` giving public access to fields in `Message` so they can be
 /// destructured and taken by value
 /// ```rust
-/// use trust_dns_proto::op::{Message, MessageParts};
+/// use hickory_proto::op::{Message, MessageParts};
 ///
 ///  let msg = Message::new();
 ///  let MessageParts { queries, .. } = msg.into_parts();
 /// ```
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct MessageParts {
     /// message header
     pub header: Header,
@@ -775,6 +860,29 @@ impl From<Message> for MessageParts {
     }
 }
 
+impl From<MessageParts> for Message {
+    fn from(msg: MessageParts) -> Self {
+        let MessageParts {
+            header,
+            queries,
+            answers,
+            name_servers,
+            additionals,
+            sig0,
+            edns,
+        } = msg;
+        Self {
+            header,
+            queries,
+            answers,
+            name_servers,
+            additionals,
+            signature: sig0,
+            edns,
+        }
+    }
+}
+
 impl Deref for Message {
     type Target = Header;
 
@@ -808,7 +916,7 @@ pub trait MessageFinalizer: Send + Sync + 'static {
         current_time: u32,
     ) -> ProtoResult<(Vec<Record>, Option<MessageVerifier>)>;
 
-    /// Return whether the message require futher processing before being sent
+    /// Return whether the message requires further processing before being sent
     /// By default, returns true for AXFR and IXFR queries, and Update and Notify messages
     fn should_finalize_message(&self, message: &Message) -> bool {
         [OpCode::Update, OpCode::Notify].contains(&message.op_code())
@@ -816,33 +924,6 @@ pub trait MessageFinalizer: Send + Sync + 'static {
                 .queries()
                 .iter()
                 .any(|q| [RecordType::AXFR, RecordType::IXFR].contains(&q.query_type()))
-    }
-}
-
-/// A MessageFinalizer which does nothing
-///
-/// *WARNING* This should only be used in None context, it will panic in all cases where finalize is called.
-#[derive(Clone, Copy, Debug)]
-pub struct NoopMessageFinalizer;
-
-impl NoopMessageFinalizer {
-    /// Always returns None
-    pub fn new() -> Option<Arc<Self>> {
-        None
-    }
-}
-
-impl MessageFinalizer for NoopMessageFinalizer {
-    fn finalize_message(
-        &self,
-        _: &Message,
-        _: u32,
-    ) -> ProtoResult<(Vec<Record>, Option<MessageVerifier>)> {
-        panic!("Misused NoopMessageFinalizer, None should be used instead")
-    }
-
-    fn should_finalize_message(&self, _: &Message) -> bool {
-        true
     }
 }
 
@@ -997,121 +1078,231 @@ impl<'r> BinDecodable<'r> for Message {
     }
 }
 
-#[test]
-fn test_emit_and_read_header() {
-    let mut message = Message::new();
-    message
-        .set_id(10)
-        .set_message_type(MessageType::Response)
-        .set_op_code(OpCode::Update)
-        .set_authoritative(true)
-        .set_truncated(false)
-        .set_recursion_desired(true)
-        .set_recursion_available(true)
-        .set_response_code(ResponseCode::ServFail);
+impl fmt::Display for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+        let write_query = |slice, f: &mut fmt::Formatter<'_>| -> Result<(), fmt::Error> {
+            for d in slice {
+                writeln!(f, ";; {d}")?;
+            }
 
-    test_emit_and_read(message);
-}
+            Ok(())
+        };
 
-#[test]
-fn test_emit_and_read_query() {
-    let mut message = Message::new();
-    message
-        .set_id(10)
-        .set_message_type(MessageType::Response)
-        .set_op_code(OpCode::Update)
-        .set_authoritative(true)
-        .set_truncated(true)
-        .set_recursion_desired(true)
-        .set_recursion_available(true)
-        .set_response_code(ResponseCode::ServFail)
-        .add_query(Query::new())
-        .update_counts(); // we're not testing the query parsing, just message
+        let write_slice = |slice, f: &mut fmt::Formatter<'_>| -> Result<(), fmt::Error> {
+            for d in slice {
+                writeln!(f, "{d}")?;
+            }
 
-    test_emit_and_read(message);
-}
+            Ok(())
+        };
 
-#[test]
-fn test_emit_and_read_records() {
-    let mut message = Message::new();
-    message
-        .set_id(10)
-        .set_message_type(MessageType::Response)
-        .set_op_code(OpCode::Update)
-        .set_authoritative(true)
-        .set_truncated(true)
-        .set_recursion_desired(true)
-        .set_recursion_available(true)
-        .set_authentic_data(true)
-        .set_checking_disabled(true)
-        .set_response_code(ResponseCode::ServFail);
+        writeln!(f, "; header {header}", header = self.header())?;
 
-    message.add_answer(Record::new());
-    message.add_name_server(Record::new());
-    message.add_additional(Record::new());
-    message.update_counts(); // needed for the comparison...
+        if let Some(edns) = self.extensions() {
+            writeln!(f, "; edns {edns}")?;
+        }
 
-    test_emit_and_read(message);
+        writeln!(f, "; query")?;
+        write_query(self.queries(), f)?;
+
+        if self.header().message_type() == MessageType::Response
+            || self.header().op_code() == OpCode::Update
+        {
+            writeln!(f, "; answers {}", self.answer_count())?;
+            write_slice(self.answers(), f)?;
+            writeln!(f, "; nameservers {}", self.name_server_count())?;
+            write_slice(self.name_servers(), f)?;
+            writeln!(f, "; additionals {}", self.additional_count())?;
+            write_slice(self.additionals(), f)?;
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
-fn test_emit_and_read(message: Message) {
-    let mut byte_vec: Vec<u8> = Vec::with_capacity(512);
-    {
-        let mut encoder = BinEncoder::new(&mut byte_vec);
-        message.emit(&mut encoder).unwrap();
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_emit_and_read_header() {
+        let mut message = Message::new();
+        message
+            .set_id(10)
+            .set_message_type(MessageType::Response)
+            .set_op_code(OpCode::Update)
+            .set_authoritative(true)
+            .set_truncated(false)
+            .set_recursion_desired(true)
+            .set_recursion_available(true)
+            .set_response_code(ResponseCode::ServFail);
+
+        test_emit_and_read(message);
     }
 
-    let mut decoder = BinDecoder::new(&byte_vec);
-    let got = Message::read(&mut decoder).unwrap();
+    #[test]
+    fn test_emit_and_read_query() {
+        let mut message = Message::new();
+        message
+            .set_id(10)
+            .set_message_type(MessageType::Response)
+            .set_op_code(OpCode::Update)
+            .set_authoritative(true)
+            .set_truncated(true)
+            .set_recursion_desired(true)
+            .set_recursion_available(true)
+            .set_response_code(ResponseCode::ServFail)
+            .add_query(Query::new())
+            .update_counts(); // we're not testing the query parsing, just message
 
-    assert_eq!(got, message);
-}
-
-#[test]
-#[rustfmt::skip]
-fn test_legit_message() {
-    let buf: Vec<u8> = vec![
-  0x10,0x00,0x81,0x80, // id = 4096, response, op=query, recursion_desired, recursion_available, no_error
-  0x00,0x01,0x00,0x01, // 1 query, 1 answer,
-  0x00,0x00,0x00,0x00, // 0 namesservers, 0 additional record
-
-  0x03,b'w',b'w',b'w', // query --- www.example.com
-  0x07,b'e',b'x',b'a', //
-  b'm',b'p',b'l',b'e', //
-  0x03,b'c',b'o',b'm', //
-  0x00,                // 0 = endname
-  0x00,0x01,0x00,0x01, // ReordType = A, Class = IN
-
-  0xC0,0x0C,           // name pointer to www.example.com
-  0x00,0x01,0x00,0x01, // RecordType = A, Class = IN
-  0x00,0x00,0x00,0x02, // TTL = 2 seconds
-  0x00,0x04,           // record length = 4 (ipv4 address)
-  0x5D,0xB8,0xD8,0x22, // address = 93.184.216.34
-  ];
-
-    let mut decoder = BinDecoder::new(&buf);
-    let message = Message::read(&mut decoder).unwrap();
-
-    assert_eq!(message.id(), 4096);
-
-    let mut buf: Vec<u8> = Vec::with_capacity(512);
-    {
-        let mut encoder = BinEncoder::new(&mut buf);
-        message.emit(&mut encoder).unwrap();
+        test_emit_and_read(message);
     }
 
-    let mut decoder = BinDecoder::new(&buf);
-    let message = Message::read(&mut decoder).unwrap();
+    #[test]
+    fn test_emit_and_read_records() {
+        let mut message = Message::new();
+        message
+            .set_id(10)
+            .set_message_type(MessageType::Response)
+            .set_op_code(OpCode::Update)
+            .set_authoritative(true)
+            .set_truncated(true)
+            .set_recursion_desired(true)
+            .set_recursion_available(true)
+            .set_authentic_data(true)
+            .set_checking_disabled(true)
+            .set_response_code(ResponseCode::ServFail);
 
-    assert_eq!(message.id(), 4096);
-}
+        message.add_answer(Record::stub());
+        message.add_name_server(Record::stub());
+        message.add_additional(Record::stub());
+        message.update_counts();
 
-#[test]
-fn rdata_zero_roundtrip() {
-    let buf = &[
-        160, 160, 0, 13, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0,
-    ];
+        test_emit_and_read(message);
+    }
 
-    assert!(Message::from_bytes(buf).is_err());
+    #[cfg(test)]
+    fn test_emit_and_read(message: Message) {
+        let mut byte_vec: Vec<u8> = Vec::with_capacity(512);
+        {
+            let mut encoder = BinEncoder::new(&mut byte_vec);
+            message.emit(&mut encoder).unwrap();
+        }
+
+        let mut decoder = BinDecoder::new(&byte_vec);
+        let got = Message::read(&mut decoder).unwrap();
+
+        assert_eq!(got, message);
+    }
+
+    #[test]
+    fn test_header_counts_correction_after_emit_read() {
+        let mut message = Message::new();
+
+        message
+            .set_id(10)
+            .set_message_type(MessageType::Response)
+            .set_op_code(OpCode::Update)
+            .set_authoritative(true)
+            .set_truncated(true)
+            .set_recursion_desired(true)
+            .set_recursion_available(true)
+            .set_authentic_data(true)
+            .set_checking_disabled(true)
+            .set_response_code(ResponseCode::ServFail);
+
+        message.add_answer(Record::stub());
+        message.add_name_server(Record::stub());
+        message.add_additional(Record::stub());
+
+        // at here, we don't call update_counts and we even set wrong count,
+        // because we are trying to test whether the counts in the header
+        // are correct after the message is emitted and read.
+        message.set_query_count(1);
+        message.set_answer_count(5);
+        message.set_name_server_count(5);
+        // message.set_additional_count(1);
+
+        let got = get_message_after_emitting_and_reading(message);
+
+        // make comparison
+        assert_eq!(got.query_count(), 0);
+        assert_eq!(got.answer_count(), 1);
+        assert_eq!(got.name_server_count(), 1);
+        assert_eq!(got.additional_count(), 1);
+    }
+
+    #[cfg(test)]
+    fn get_message_after_emitting_and_reading(message: Message) -> Message {
+        let mut byte_vec: Vec<u8> = Vec::with_capacity(512);
+        {
+            let mut encoder = BinEncoder::new(&mut byte_vec);
+            message.emit(&mut encoder).unwrap();
+        }
+
+        let mut decoder = BinDecoder::new(&byte_vec);
+
+        Message::read(&mut decoder).unwrap()
+    }
+
+    #[test]
+    fn test_legit_message() {
+        #[rustfmt::skip]
+        let buf: Vec<u8> = vec![
+            0x10, 0x00, 0x81,
+            0x80, // id = 4096, response, op=query, recursion_desired, recursion_available, no_error
+            0x00, 0x01, 0x00, 0x01, // 1 query, 1 answer,
+            0x00, 0x00, 0x00, 0x00, // 0 nameservers, 0 additional record
+            0x03, b'w', b'w', b'w', // query --- www.example.com
+            0x07, b'e', b'x', b'a', //
+            b'm', b'p', b'l', b'e', //
+            0x03, b'c', b'o', b'm', //
+            0x00,                   // 0 = endname
+            0x00, 0x01, 0x00, 0x01, // RecordType = A, Class = IN
+            0xC0, 0x0C,             // name pointer to www.example.com
+            0x00, 0x01, 0x00, 0x01, // RecordType = A, Class = IN
+            0x00, 0x00, 0x00, 0x02, // TTL = 2 seconds
+            0x00, 0x04,             // record length = 4 (ipv4 address)
+            0x5D, 0xB8, 0xD7, 0x0E, // address = 93.184.215.14
+        ];
+
+        let mut decoder = BinDecoder::new(&buf);
+        let message = Message::read(&mut decoder).unwrap();
+
+        assert_eq!(message.id(), 4_096);
+
+        let mut buf: Vec<u8> = Vec::with_capacity(512);
+        {
+            let mut encoder = BinEncoder::new(&mut buf);
+            message.emit(&mut encoder).unwrap();
+        }
+
+        let mut decoder = BinDecoder::new(&buf);
+        let message = Message::read(&mut decoder).unwrap();
+
+        assert_eq!(message.id(), 4_096);
+    }
+
+    #[test]
+    fn rdata_zero_roundtrip() {
+        let buf = &[
+            160, 160, 0, 13, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0,
+        ];
+
+        assert!(Message::from_bytes(buf).is_err());
+    }
+
+    #[test]
+    fn nsec_deserialization() {
+        const CRASHING_MESSAGE: &[u8] = &[
+            0, 0, 132, 0, 0, 0, 0, 1, 0, 0, 0, 1, 36, 49, 101, 48, 101, 101, 51, 100, 51, 45, 100,
+            52, 50, 52, 45, 52, 102, 55, 56, 45, 57, 101, 52, 99, 45, 99, 51, 56, 51, 51, 55, 55,
+            56, 48, 102, 50, 98, 5, 108, 111, 99, 97, 108, 0, 0, 1, 128, 1, 0, 0, 0, 120, 0, 4,
+            192, 168, 1, 17, 36, 49, 101, 48, 101, 101, 51, 100, 51, 45, 100, 52, 50, 52, 45, 52,
+            102, 55, 56, 45, 57, 101, 52, 99, 45, 99, 51, 56, 51, 51, 55, 55, 56, 48, 102, 50, 98,
+            5, 108, 111, 99, 97, 108, 0, 0, 47, 128, 1, 0, 0, 0, 120, 0, 5, 192, 70, 0, 1, 64,
+        ];
+
+        Message::from_vec(CRASHING_MESSAGE).expect("failed to parse message");
+    }
 }

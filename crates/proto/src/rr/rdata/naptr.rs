@@ -1,20 +1,23 @@
-// Copyright 2015-2019 Benjamin Fry <benjaminfry@me.com>
+// Copyright 2015-2023 Benjamin Fry <benjaminfry@me.com>
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
 //! Dynamic Delegation Discovery System
 
-use std::fmt;
+use alloc::{boxed::Box, string::String};
+use core::fmt;
 
-#[cfg(feature = "serde-config")]
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use crate::error::*;
-use crate::rr::domain::Name;
-use crate::serialize::binary::*;
+use crate::{
+    error::{ProtoError, ProtoResult},
+    rr::{RData, RecordData, RecordType, domain::Name},
+    serialize::binary::*,
+};
 
 /// [RFC 3403 DDDS DNS Database, October 2002](https://tools.ietf.org/html/rfc3403#section-4)
 ///
@@ -45,7 +48,7 @@ use crate::serialize::binary::*;
 ///   <character-string> and <domain-name> as used here are defined in RFC
 ///   1035 [7].
 /// ```
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct NAPTR {
     order: u16,
@@ -167,7 +170,7 @@ impl NAPTR {
     ///      As stated in the DDDS algorithm, The regular expressions MUST NOT
     ///      be used in a cumulative fashion, that is, they should only be
     ///      applied to the original string held by the client, never to the
-    ///      domain name p  roduced by a previous NAPTR rewrite.  The latter is
+    ///      domain name produced by a previous NAPTR rewrite.  The latter is
     ///      tempting in some applications but experience has shown such use to
     ///      be extremely fault sensitive, very error prone, and extremely
     ///      difficult to debug.
@@ -203,34 +206,60 @@ pub fn verify_flags(flags: &[u8]) -> bool {
         .all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z'))
 }
 
-/// Read the RData from the given Decoder
-pub fn read(decoder: &mut BinDecoder<'_>) -> ProtoResult<NAPTR> {
-    Ok(NAPTR::new(
-        decoder.read_u16()?.unverified(/*any u16 is valid*/),
-        decoder.read_u16()?.unverified(/*any u16 is valid*/),
-        // must be 0-9a-z
-        decoder
-            .read_character_data()?
-            .verify_unwrap(|s| verify_flags(s))
-            .map_err(|_e| ProtoError::from("flags are not within range [a-zA-Z0-9]"))?
-            .to_vec()
-            .into_boxed_slice(),
-        decoder.read_character_data()?.unverified(/*any chardata*/).to_vec().into_boxed_slice(),
-        decoder.read_character_data()?.unverified(/*any chardata*/).to_vec().into_boxed_slice(),
-        Name::read(decoder)?,
-    ))
+impl BinEncodable for NAPTR {
+    fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
+        self.order.emit(encoder)?;
+        self.preference.emit(encoder)?;
+        encoder.emit_character_data(&self.flags)?;
+        encoder.emit_character_data(&self.services)?;
+        encoder.emit_character_data(&self.regexp)?;
+
+        encoder.with_canonical_names(|encoder| self.replacement.emit(encoder))?;
+        Ok(())
+    }
 }
 
-/// Declares the method for emitting this type
-pub fn emit(encoder: &mut BinEncoder<'_>, naptr: &NAPTR) -> ProtoResult<()> {
-    naptr.order.emit(encoder)?;
-    naptr.preference.emit(encoder)?;
-    encoder.emit_character_data(&naptr.flags)?;
-    encoder.emit_character_data(&naptr.services)?;
-    encoder.emit_character_data(&naptr.regexp)?;
+impl<'r> BinDecodable<'r> for NAPTR {
+    fn read(decoder: &mut BinDecoder<'r>) -> ProtoResult<Self> {
+        Ok(Self::new(
+            decoder.read_u16()?.unverified(/*any u16 is valid*/),
+            decoder.read_u16()?.unverified(/*any u16 is valid*/),
+            // must be 0-9a-z
+            decoder
+                .read_character_data()?
+                .verify_unwrap(|s| verify_flags(s))
+                .map_err(|_e| ProtoError::from("flags are not within range [a-zA-Z0-9]"))?
+                .to_vec()
+                .into_boxed_slice(),
+            decoder.read_character_data()?.unverified(/*any chardata*/).to_vec().into_boxed_slice(),
+            decoder.read_character_data()?.unverified(/*any chardata*/).to_vec().into_boxed_slice(),
+            Name::read(decoder)?,
+        ))
+    }
+}
 
-    encoder.with_canonical_names(|encoder| naptr.replacement.emit(encoder))?;
-    Ok(())
+impl RecordData for NAPTR {
+    fn try_from_rdata(data: RData) -> Result<Self, RData> {
+        match data {
+            RData::NAPTR(csync) => Ok(csync),
+            _ => Err(data),
+        }
+    }
+
+    fn try_borrow(data: &RData) -> Option<&Self> {
+        match data {
+            RData::NAPTR(csync) => Some(csync),
+            _ => None,
+        }
+    }
+
+    fn record_type(&self) -> RecordType {
+        RecordType::NAPTR
+    }
+
+    fn into_rdata(self) -> RData {
+        RData::NAPTR(self)
+    }
 }
 
 /// [RFC 2915](https://tools.ietf.org/html/rfc2915), NAPTR DNS RR, September 2000
@@ -246,7 +275,7 @@ pub fn emit(encoder: &mut BinEncoder<'_>, naptr: &NAPTR) -> ProtoResult<()> {
 ///   care.  See Section 10 for how to correctly enter and escape the
 ///   regular expression.
 ///
-/// ;;      order pref flags service           regexp replacement
+/// ;;      order pflags service           regexp replacement
 /// IN NAPTR 100  50  "a"    "z3950+N2L+N2C"     ""   cidserver.example.com.
 /// IN NAPTR 100  50  "a"    "rcds+N2C"          ""   cidserver.example.com.
 /// IN NAPTR 100  50  "s"    "http+N2L+N2C+N2R"  ""   www.example.com.
@@ -270,10 +299,13 @@ impl fmt::Display for NAPTR {
 mod tests {
     #![allow(clippy::dbg_macro, clippy::print_stdout)]
 
+    use alloc::vec::Vec;
+    use std::println;
+
     use super::*;
     #[test]
     fn test() {
-        use std::str::FromStr;
+        use core::str::FromStr;
 
         let rdata = NAPTR::new(
             8,
@@ -281,24 +313,24 @@ mod tests {
             b"aa11AA".to_vec().into_boxed_slice(),
             b"services".to_vec().into_boxed_slice(),
             b"regexpr".to_vec().into_boxed_slice(),
-            Name::from_str("naptr.example.com").unwrap(),
+            Name::from_str("naptr.example.com.").unwrap(),
         );
 
         let mut bytes = Vec::new();
         let mut encoder: BinEncoder<'_> = BinEncoder::new(&mut bytes);
-        assert!(emit(&mut encoder, &rdata).is_ok());
+        assert!(rdata.emit(&mut encoder).is_ok());
         let bytes = encoder.into_bytes();
 
-        println!("bytes: {:?}", bytes);
+        println!("bytes: {bytes:?}");
 
         let mut decoder: BinDecoder<'_> = BinDecoder::new(bytes);
-        let read_rdata = read(&mut decoder).expect("Decoding error");
+        let read_rdata = NAPTR::read(&mut decoder).expect("Decoding error");
         assert_eq!(rdata, read_rdata);
     }
 
     #[test]
     fn test_bad_data() {
-        use std::str::FromStr;
+        use core::str::FromStr;
 
         let rdata = NAPTR::new(
             8,
@@ -311,13 +343,13 @@ mod tests {
 
         let mut bytes = Vec::new();
         let mut encoder: BinEncoder<'_> = BinEncoder::new(&mut bytes);
-        assert!(emit(&mut encoder, &rdata).is_ok());
+        assert!(rdata.emit(&mut encoder).is_ok());
         let bytes = encoder.into_bytes();
 
-        println!("bytes: {:?}", bytes);
+        println!("bytes: {bytes:?}");
 
         let mut decoder: BinDecoder<'_> = BinDecoder::new(bytes);
-        let read_rdata = read(&mut decoder);
+        let read_rdata = NAPTR::read(&mut decoder);
         assert!(
             read_rdata.is_err(),
             "should have failed decoding with bad flag data"

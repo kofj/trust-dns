@@ -1,27 +1,27 @@
 // Copyright 2015-2017 Benjamin Fry <benjaminfry@me.com>
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
 //! LookupIp result from a resolution of ipv4 and ipv6 records with a Resolver.
 //!
 //! At it's heart LookupIp uses Lookup for performing all lookups. It is unlike other standard lookups in that there are customizations around A and AAAA resolutions.
 
-use std::error::Error;
-use std::net::IpAddr;
+use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use futures_util::{future, future::Either, future::Future, FutureExt};
+use futures_util::{FutureExt, future, future::Either};
+use tracing::debug;
 
-use proto::error::ProtoError;
-use proto::op::Query;
-use proto::rr::{Name, RData, Record, RecordType};
-use proto::xfer::{DnsHandle, DnsRequestOptions};
+use crate::proto::op::Query;
+use crate::proto::rr::{Name, RData, Record, RecordType};
+use crate::proto::xfer::{DnsHandle, DnsRequestOptions};
 
 use crate::caching_client::CachingClient;
 use crate::config::LookupIpStrategy;
@@ -37,7 +37,9 @@ use crate::lookup::{Lookup, LookupIntoIter, LookupIter};
 pub struct LookupIp(Lookup);
 
 impl LookupIp {
-    /// Returns a borrowed iterator of the returned IPs
+    /// Returns an iterator over the response records.
+    ///
+    /// Only IP records will be returned, either A or AAAA record types.
     pub fn iter(&self) -> LookupIpIter<'_> {
         LookupIpIter(self.0.iter())
     }
@@ -75,17 +77,16 @@ impl From<LookupIp> for Lookup {
 /// Borrowed view of set of IPs returned from a LookupIp
 pub struct LookupIpIter<'i>(pub(crate) LookupIter<'i>);
 
-impl<'i> Iterator for LookupIpIter<'i> {
+impl Iterator for LookupIpIter<'_> {
     type Item = IpAddr;
 
     fn next(&mut self) -> Option<Self::Item> {
         let iter: &mut _ = &mut self.0;
-        iter.filter_map(|rdata| match *rdata {
-            RData::A(ip) => Some(IpAddr::from(ip)),
-            RData::AAAA(ip) => Some(IpAddr::from(ip)),
+        iter.find_map(|rdata| match rdata {
+            RData::A(ip) => Some(IpAddr::from(Ipv4Addr::from(*ip))),
+            RData::AAAA(ip) => Some(IpAddr::from(Ipv6Addr::from(*ip))),
             _ => None,
         })
-        .next()
     }
 }
 
@@ -93,8 +94,7 @@ impl IntoIterator for LookupIp {
     type Item = IpAddr;
     type IntoIter = LookupIpIntoIter;
 
-    /// This is most likely not a free conversion, the RDatas will be cloned if data is
-    ///  held behind an Arc with more than one reference (which is most likely the case coming from cache)
+    /// This is not a free conversion, because the `RData`s are cloned.
     fn into_iter(self) -> Self::IntoIter {
         LookupIpIntoIter(self.0.into_iter())
     }
@@ -108,24 +108,22 @@ impl Iterator for LookupIpIntoIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         let iter: &mut _ = &mut self.0;
-        iter.filter_map(|rdata| match rdata {
-            RData::A(ip) => Some(IpAddr::from(ip)),
-            RData::AAAA(ip) => Some(IpAddr::from(ip)),
+        iter.find_map(|rdata| match rdata {
+            RData::A(ip) => Some(IpAddr::from(Ipv4Addr::from(ip))),
+            RData::AAAA(ip) => Some(IpAddr::from(Ipv6Addr::from(ip))),
             _ => None,
         })
-        .next()
     }
 }
 
-/// The Future returned from [crate::AsyncResolver] when performing an A or AAAA lookup.
+/// The Future returned from [crate::Resolver] when performing an A or AAAA lookup.
 ///
 /// This type isn't necessarily something that should be used by users, see the default TypeParameters are generally correct
-pub struct LookupIpFuture<C, E>
+pub struct LookupIpFuture<C>
 where
-    C: DnsHandle<Error = E> + 'static,
-    E: Into<ResolveError> + From<ProtoError> + Error + Clone + Send + Unpin + 'static,
+    C: DnsHandle + 'static,
 {
-    client_cache: CachingClient<C, E>,
+    client_cache: CachingClient<C>,
     names: Vec<Name>,
     strategy: LookupIpStrategy,
     options: DnsRequestOptions,
@@ -134,10 +132,9 @@ where
     finally_ip_addr: Option<RData>,
 }
 
-impl<C, E> Future for LookupIpFuture<C, E>
+impl<C> Future for LookupIpFuture<C>
 where
-    C: DnsHandle<Error = E> + 'static,
-    E: Into<ResolveError> + From<ProtoError> + Error + Clone + Send + Unpin + 'static,
+    C: DnsHandle + 'static,
 {
     type Output = Result<LookupIp, ResolveError>;
 
@@ -147,13 +144,13 @@ where
             let query = self.query.as_mut().poll(cx);
 
             // Determine whether or not we will attempt to retry the query.
-            let should_retry = match query {
+            let should_retry = match &query {
                 // If the query is NotReady, yield immediately.
                 Poll::Pending => return Poll::Pending,
                 // If the query returned a successful lookup, we will attempt
                 // to retry if the lookup is empty. Otherwise, we will return
                 // that lookup.
-                Poll::Ready(Ok(ref lookup)) => lookup.is_empty(),
+                Poll::Ready(Ok(lookup)) => lookup.is_empty(),
                 // If the query failed, we will attempt to retry.
                 Poll::Ready(Err(_)) => true,
             };
@@ -194,10 +191,9 @@ where
     }
 }
 
-impl<C, E> LookupIpFuture<C, E>
+impl<C> LookupIpFuture<C>
 where
-    C: DnsHandle<Error = E> + 'static,
-    E: Into<ResolveError> + From<ProtoError> + Error + Clone + Send + Unpin + 'static,
+    C: DnsHandle + 'static,
 {
     /// Perform a lookup from a hostname to a set of IPs
     ///
@@ -209,7 +205,7 @@ where
     pub fn lookup(
         names: Vec<Name>,
         strategy: LookupIpStrategy,
-        client_cache: CachingClient<C, E>,
+        client_cache: CachingClient<C>,
         options: DnsRequestOptions,
         hosts: Option<Arc<Hosts>>,
         finally_ip_addr: Option<RData>,
@@ -231,16 +227,15 @@ where
 }
 
 /// returns a new future for lookup
-async fn strategic_lookup<C, E>(
+async fn strategic_lookup<C>(
     name: Name,
     strategy: LookupIpStrategy,
-    client: CachingClient<C, E>,
+    client: CachingClient<C>,
     options: DnsRequestOptions,
     hosts: Option<Arc<Hosts>>,
 ) -> Result<Lookup, ResolveError>
 where
-    C: DnsHandle<Error = E> + 'static,
-    E: Into<ResolveError> + From<ProtoError> + Error + Clone + Send + Unpin + 'static,
+    C: DnsHandle + 'static,
 {
     match strategy {
         LookupIpStrategy::Ipv4Only => ipv4_only(name, client, options, hosts).await,
@@ -252,15 +247,14 @@ where
 }
 
 /// first lookups in hosts, then performs the query
-async fn hosts_lookup<C, E>(
+async fn hosts_lookup<C>(
     query: Query,
-    mut client: CachingClient<C, E>,
+    mut client: CachingClient<C>,
     options: DnsRequestOptions,
     hosts: Option<Arc<Hosts>>,
 ) -> Result<Lookup, ResolveError>
 where
-    C: DnsHandle<Error = E> + 'static,
-    E: Into<ResolveError> + From<ProtoError> + Error + Clone + Send + Unpin + 'static,
+    C: DnsHandle + 'static,
 {
     if let Some(hosts) = hosts {
         if let Some(lookup) = hosts.lookup_static_host(&query) {
@@ -272,44 +266,41 @@ where
 }
 
 /// queries only for A records
-async fn ipv4_only<C, E>(
+async fn ipv4_only<C>(
     name: Name,
-    client: CachingClient<C, E>,
+    client: CachingClient<C>,
     options: DnsRequestOptions,
     hosts: Option<Arc<Hosts>>,
 ) -> Result<Lookup, ResolveError>
 where
-    C: DnsHandle<Error = E> + 'static,
-    E: Into<ResolveError> + From<ProtoError> + Error + Clone + Send + Unpin + 'static,
+    C: DnsHandle + 'static,
 {
     hosts_lookup(Query::query(name, RecordType::A), client, options, hosts).await
 }
 
 /// queries only for AAAA records
-async fn ipv6_only<C, E>(
+async fn ipv6_only<C>(
     name: Name,
-    client: CachingClient<C, E>,
+    client: CachingClient<C>,
     options: DnsRequestOptions,
     hosts: Option<Arc<Hosts>>,
 ) -> Result<Lookup, ResolveError>
 where
-    C: DnsHandle<Error = E> + 'static,
-    E: Into<ResolveError> + From<ProtoError> + Error + Clone + Send + Unpin + 'static,
+    C: DnsHandle + 'static,
 {
     hosts_lookup(Query::query(name, RecordType::AAAA), client, options, hosts).await
 }
 
 // TODO: this really needs to have a stream interface
 /// queries only for A and AAAA in parallel
-async fn ipv4_and_ipv6<C, E>(
+async fn ipv4_and_ipv6<C>(
     name: Name,
-    client: CachingClient<C, E>,
+    client: CachingClient<C>,
     options: DnsRequestOptions,
     hosts: Option<Arc<Hosts>>,
 ) -> Result<Lookup, ResolveError>
 where
-    C: DnsHandle<Error = E> + 'static,
-    E: Into<ResolveError> + From<ProtoError> + Error + Clone + Send + Unpin + 'static,
+    C: DnsHandle + 'static,
 {
     let sel_res = future::select(
         hosts_lookup(
@@ -354,15 +345,14 @@ where
 }
 
 /// queries only for AAAA and on no results queries for A
-async fn ipv6_then_ipv4<C, E>(
+async fn ipv6_then_ipv4<C>(
     name: Name,
-    client: CachingClient<C, E>,
+    client: CachingClient<C>,
     options: DnsRequestOptions,
     hosts: Option<Arc<Hosts>>,
 ) -> Result<Lookup, ResolveError>
 where
-    C: DnsHandle<Error = E> + 'static,
-    E: Into<ResolveError> + From<ProtoError> + Error + Clone + Send + Unpin + 'static,
+    C: DnsHandle + 'static,
 {
     rt_then_swap(
         name,
@@ -376,15 +366,14 @@ where
 }
 
 /// queries only for A and on no results queries for AAAA
-async fn ipv4_then_ipv6<C, E>(
+async fn ipv4_then_ipv6<C>(
     name: Name,
-    client: CachingClient<C, E>,
+    client: CachingClient<C>,
     options: DnsRequestOptions,
     hosts: Option<Arc<Hosts>>,
 ) -> Result<Lookup, ResolveError>
 where
-    C: DnsHandle<Error = E> + 'static,
-    E: Into<ResolveError> + From<ProtoError> + Error + Clone + Send + Unpin + 'static,
+    C: DnsHandle + 'static,
 {
     rt_then_swap(
         name,
@@ -398,17 +387,16 @@ where
 }
 
 /// queries only for first_type and on no results queries for second_type
-async fn rt_then_swap<C, E>(
+async fn rt_then_swap<C>(
     name: Name,
-    client: CachingClient<C, E>,
+    client: CachingClient<C>,
     first_type: RecordType,
     second_type: RecordType,
     options: DnsRequestOptions,
     hosts: Option<Arc<Hosts>>,
 ) -> Result<Lookup, ResolveError>
 where
-    C: DnsHandle<Error = E> + 'static,
-    E: Into<ResolveError> + From<ProtoError> + Error + Clone + Send + Unpin + 'static,
+    C: DnsHandle + 'static,
 {
     let or_client = client.clone();
     let res = hosts_lookup(
@@ -447,76 +435,74 @@ where
 }
 
 #[cfg(test)]
-pub mod tests {
+pub(crate) mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::{Arc, Mutex};
 
     use futures_executor::block_on;
     use futures_util::future;
+    use futures_util::stream::{Stream, once};
+    use test_support::subscribe;
 
-    use proto::op::Message;
-    use proto::rr::{Name, RData, Record};
-    use proto::xfer::{DnsHandle, DnsRequest, DnsResponse};
-
-    use futures_util::stream::{once, Stream};
+    use crate::proto::ProtoError;
+    use crate::proto::op::Message;
+    use crate::proto::rr::{Name, RData, Record};
+    use crate::proto::xfer::{DnsHandle, DnsRequest, DnsResponse};
 
     use super::*;
-    use crate::error::ResolveError;
 
     #[derive(Clone)]
-    pub struct MockDnsHandle {
-        messages: Arc<Mutex<Vec<Result<DnsResponse, ResolveError>>>>,
+    pub(crate) struct MockDnsHandle {
+        messages: Arc<Mutex<Vec<Result<DnsResponse, ProtoError>>>>,
     }
 
     impl DnsHandle for MockDnsHandle {
-        type Response =
-            Pin<Box<dyn Stream<Item = Result<DnsResponse, ResolveError>> + Send + Unpin>>;
-        type Error = ResolveError;
+        type Response = Pin<Box<dyn Stream<Item = Result<DnsResponse, ProtoError>> + Send + Unpin>>;
 
-        fn send<R: Into<DnsRequest>>(&mut self, _: R) -> Self::Response {
+        fn send<R: Into<DnsRequest>>(&self, _: R) -> Self::Response {
             Box::pin(once(future::ready(
                 self.messages.lock().unwrap().pop().unwrap_or_else(empty),
             )))
         }
     }
 
-    pub fn v4_message() -> Result<DnsResponse, ResolveError> {
+    pub(crate) fn v4_message() -> Result<DnsResponse, ProtoError> {
         let mut message = Message::new();
         message.add_query(Query::query(Name::root(), RecordType::A));
         message.insert_answers(vec![Record::from_rdata(
             Name::root(),
             86400,
-            RData::A(Ipv4Addr::new(127, 0, 0, 1)),
+            RData::A(Ipv4Addr::LOCALHOST.into()),
         )]);
 
-        let resp: DnsResponse = message.into();
+        let resp = DnsResponse::from_message(message).unwrap();
         assert!(resp.contains_answer());
         Ok(resp)
     }
 
-    pub fn v6_message() -> Result<DnsResponse, ResolveError> {
+    pub(crate) fn v6_message() -> Result<DnsResponse, ProtoError> {
         let mut message = Message::new();
         message.add_query(Query::query(Name::root(), RecordType::AAAA));
         message.insert_answers(vec![Record::from_rdata(
             Name::root(),
             86400,
-            RData::AAAA(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
+            RData::AAAA(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1).into()),
         )]);
 
-        let resp: DnsResponse = message.into();
+        let resp = DnsResponse::from_message(message).unwrap();
         assert!(resp.contains_answer());
         Ok(resp)
     }
 
-    pub fn empty() -> Result<DnsResponse, ResolveError> {
-        Ok(Message::new().into())
+    pub(crate) fn empty() -> Result<DnsResponse, ProtoError> {
+        Ok(DnsResponse::from_message(Message::new()).unwrap())
     }
 
-    pub fn error() -> Result<DnsResponse, ResolveError> {
-        Err(ResolveError::from("forced test failure"))
+    pub(crate) fn error() -> Result<DnsResponse, ProtoError> {
+        Err(ProtoError::from("forced test failure"))
     }
 
-    pub fn mock(messages: Vec<Result<DnsResponse, ResolveError>>) -> MockDnsHandle {
+    pub(crate) fn mock(messages: Vec<Result<DnsResponse, ProtoError>>) -> MockDnsHandle {
         MockDnsHandle {
             messages: Arc::new(Mutex::new(messages)),
         }
@@ -524,6 +510,7 @@ pub mod tests {
 
     #[test]
     fn test_ipv4_only_strategy() {
+        subscribe();
         assert_eq!(
             block_on(ipv4_only(
                 Name::root(),
@@ -533,14 +520,15 @@ pub mod tests {
             ))
             .unwrap()
             .iter()
-            .map(|r| r.to_ip_addr().unwrap())
+            .map(|r| r.ip_addr().unwrap())
             .collect::<Vec<IpAddr>>(),
-            vec![Ipv4Addr::new(127, 0, 0, 1)]
+            vec![Ipv4Addr::LOCALHOST]
         );
     }
 
     #[test]
     fn test_ipv6_only_strategy() {
+        subscribe();
         assert_eq!(
             block_on(ipv6_only(
                 Name::root(),
@@ -550,7 +538,7 @@ pub mod tests {
             ))
             .unwrap()
             .iter()
-            .map(|r| r.to_ip_addr().unwrap())
+            .map(|r| r.ip_addr().unwrap())
             .collect::<Vec<IpAddr>>(),
             vec![Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)]
         );
@@ -558,6 +546,7 @@ pub mod tests {
 
     #[test]
     fn test_ipv4_and_ipv6_strategy() {
+        subscribe();
         // ipv6 is consistently queried first (even though the select has it second)
         // both succeed
         assert_eq!(
@@ -569,10 +558,10 @@ pub mod tests {
             ))
             .unwrap()
             .iter()
-            .map(|r| r.to_ip_addr().unwrap())
+            .map(|r| r.ip_addr().unwrap())
             .collect::<Vec<IpAddr>>(),
             vec![
-                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
                 IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
             ]
         );
@@ -587,9 +576,9 @@ pub mod tests {
             ))
             .unwrap()
             .iter()
-            .map(|r| r.to_ip_addr().unwrap())
+            .map(|r| r.ip_addr().unwrap())
             .collect::<Vec<IpAddr>>(),
-            vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]
+            vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]
         );
 
         // error then ipv4
@@ -602,9 +591,9 @@ pub mod tests {
             ))
             .unwrap()
             .iter()
-            .map(|r| r.to_ip_addr().unwrap())
+            .map(|r| r.ip_addr().unwrap())
             .collect::<Vec<IpAddr>>(),
-            vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]
+            vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]
         );
 
         // only ipv6 available
@@ -617,7 +606,7 @@ pub mod tests {
             ))
             .unwrap()
             .iter()
-            .map(|r| r.to_ip_addr().unwrap())
+            .map(|r| r.ip_addr().unwrap())
             .collect::<Vec<IpAddr>>(),
             vec![IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1))]
         );
@@ -632,7 +621,7 @@ pub mod tests {
             ))
             .unwrap()
             .iter()
-            .map(|r| r.to_ip_addr().unwrap())
+            .map(|r| r.ip_addr().unwrap())
             .collect::<Vec<IpAddr>>(),
             vec![IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1))]
         );
@@ -640,6 +629,7 @@ pub mod tests {
 
     #[test]
     fn test_ipv6_then_ipv4_strategy() {
+        subscribe();
         // ipv6 first
         assert_eq!(
             block_on(ipv6_then_ipv4(
@@ -650,7 +640,7 @@ pub mod tests {
             ))
             .unwrap()
             .iter()
-            .map(|r| r.to_ip_addr().unwrap())
+            .map(|r| r.ip_addr().unwrap())
             .collect::<Vec<IpAddr>>(),
             vec![Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)]
         );
@@ -665,9 +655,9 @@ pub mod tests {
             ))
             .unwrap()
             .iter()
-            .map(|r| r.to_ip_addr().unwrap())
+            .map(|r| r.ip_addr().unwrap())
             .collect::<Vec<IpAddr>>(),
-            vec![Ipv4Addr::new(127, 0, 0, 1)]
+            vec![Ipv4Addr::LOCALHOST]
         );
 
         // ipv4 and error
@@ -680,14 +670,15 @@ pub mod tests {
             ))
             .unwrap()
             .iter()
-            .map(|r| r.to_ip_addr().unwrap())
+            .map(|r| r.ip_addr().unwrap())
             .collect::<Vec<IpAddr>>(),
-            vec![Ipv4Addr::new(127, 0, 0, 1)]
+            vec![Ipv4Addr::LOCALHOST]
         );
     }
 
     #[test]
     fn test_ipv4_then_ipv6_strategy() {
+        subscribe();
         // ipv6 first
         assert_eq!(
             block_on(ipv4_then_ipv6(
@@ -698,9 +689,9 @@ pub mod tests {
             ))
             .unwrap()
             .iter()
-            .map(|r| r.to_ip_addr().unwrap())
+            .map(|r| r.ip_addr().unwrap())
             .collect::<Vec<IpAddr>>(),
-            vec![Ipv4Addr::new(127, 0, 0, 1)]
+            vec![Ipv4Addr::LOCALHOST]
         );
 
         // nothing then ipv6
@@ -713,7 +704,7 @@ pub mod tests {
             ))
             .unwrap()
             .iter()
-            .map(|r| r.to_ip_addr().unwrap())
+            .map(|r| r.ip_addr().unwrap())
             .collect::<Vec<IpAddr>>(),
             vec![Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)]
         );
@@ -728,7 +719,7 @@ pub mod tests {
             ))
             .unwrap()
             .iter()
-            .map(|r| r.to_ip_addr().unwrap())
+            .map(|r| r.ip_addr().unwrap())
             .collect::<Vec<IpAddr>>(),
             vec![Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)]
         );
