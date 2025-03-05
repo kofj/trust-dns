@@ -5,7 +5,7 @@
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ *     https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,8 +18,10 @@
 
 //! All defined response codes in DNS
 
-use std::fmt;
-use std::fmt::{Display, Formatter};
+use core::fmt::{self, Display, Formatter};
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 /// The status code of the response to a query.
 ///
@@ -60,6 +62,7 @@ use std::fmt::{Display, Formatter};
 ///                 6-15            Reserved for future use.
 ///  ```
 #[derive(Debug, Eq, PartialEq, PartialOrd, Copy, Clone, Hash)]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[allow(dead_code)]
 pub enum ResponseCode {
     /// No Error [RFC 1035](https://tools.ietf.org/html/rfc1035)
@@ -90,7 +93,7 @@ pub enum ResponseCode {
     NXRRSet,
 
     /// Server Not Authoritative for zone [RFC 2136](https://tools.ietf.org/html/rfc2136)
-    /// or Not Authorized [RFC 2845](https://tools.ietf.org/html/rfc2845)
+    /// or Not Authorized [RFC 8945](https://www.rfc-editor.org/rfc/rfc8945)
     NotAuth,
 
     /// Name not contained in zone [RFC 2136](https://tools.ietf.org/html/rfc2136)
@@ -99,13 +102,13 @@ pub enum ResponseCode {
     /// Bad OPT Version [RFC 6891](https://tools.ietf.org/html/rfc6891#section-9)
     BADVERS,
 
-    /// TSIG Signature Failure [RFC 2845](https://tools.ietf.org/html/rfc2845)
+    /// TSIG Signature Failure [RFC 8945](https://www.rfc-editor.org/rfc/rfc8945)
     BADSIG,
 
-    /// Key not recognized [RFC 2845](https://tools.ietf.org/html/rfc2845)
+    /// Key not recognized [RFC 8945](https://www.rfc-editor.org/rfc/rfc8945)
     BADKEY,
 
-    /// Signature out of time window [RFC 2845](https://tools.ietf.org/html/rfc2845)
+    /// Signature out of time window [RFC 8945](https://www.rfc-editor.org/rfc/rfc8945)
     BADTIME,
 
     /// Bad TKEY Mode [RFC 2930](https://tools.ietf.org/html/rfc2930#section-2.6)
@@ -126,7 +129,7 @@ pub enum ResponseCode {
     // 3841-4095    Reserved for Private Use                        [RFC6895]
     // 4096-65534   Unassigned
     // 65535        Reserved, can be allocated by Standards Action  [RFC6895]
-    /// An unknown or unregisterd response code was received.
+    /// An unknown or unregistered response code was received.
     Unknown(u16),
 }
 
@@ -157,27 +160,27 @@ impl ResponseCode {
     /// Transforms the response code into the human message
     pub fn to_str(self) -> &'static str {
         match self {
-            ResponseCode::NoError => "No Error",
-            ResponseCode::FormErr => "Form Error", // 1     FormErr       Format Error                        [RFC1035]
-            ResponseCode::ServFail => "Server Failure", // 2     ServFail      Server Failure                      [RFC1035]
-            ResponseCode::NXDomain => "Non-Existent Domain", // 3     NXDomain      Non-Existent Domain                 [RFC1035]
-            ResponseCode::NotImp => "Not Implemented", // 4     NotImp        Not Implemented                     [RFC1035]
-            ResponseCode::Refused => "Query Refused", // 5     Refused       Query Refused                       [RFC1035]
-            ResponseCode::YXDomain => "Name should not exist", // 6     YXDomain      Name Exists when it should not      [RFC2136][RFC6672]
-            ResponseCode::YXRRSet => "RR Set should not exist", // 7     YXRRSet       RR Set Exists when it should not    [RFC2136]
-            ResponseCode::NXRRSet => "RR Set does not exist", // 8     NXRRSet       RR Set that should exist does not   [RFC2136]
-            ResponseCode::NotAuth => "Not authorized", // 9     NotAuth       Server Not Authoritative for zone   [RFC2136]
-            ResponseCode::NotZone => "Name not in zone", // 10    NotZone       Name not contained in zone          [RFC2136]
-            ResponseCode::BADVERS => "Bad option verions", // 16    BADVERS       Bad OPT Version                     [RFC6891]
-            ResponseCode::BADSIG => "TSIG Failure", // 16    BADSIG        TSIG Signature Failure              [RFC2845]
-            ResponseCode::BADKEY => "Key not recognized", // 17    BADKEY        Key not recognized                  [RFC2845]
-            ResponseCode::BADTIME => "Signature out of time window", // 18    BADTIME       Signature out of time window        [RFC2845]
-            ResponseCode::BADMODE => "Bad TKEY mode", // 19    BADMODE       Bad TKEY Mode                       [RFC2930]
-            ResponseCode::BADNAME => "Duplicate key name", // 20    BADNAME       Duplicate key name                  [RFC2930]
-            ResponseCode::BADALG => "Algorithm not supported", // 21    BADALG        Algorithm not supported             [RFC2930]
-            ResponseCode::BADTRUNC => "Bad truncation", // 22    BADTRUNC      Bad Truncation                      [RFC4635]
-            ResponseCode::BADCOOKIE => "Bad server cookie", // 23    BADCOOKIE (TEMPORARY - registered 2015-07-26, expires 2016-07-26)    Bad/missing server cookie    [draft-ietf-dnsop-cookies]
-            ResponseCode::Unknown(_) => "Unknown response code",
+            Self::NoError => "No Error",
+            Self::FormErr => "Form Error", // 1     FormErr       Format Error                        [RFC1035]
+            Self::ServFail => "Server Failure", // 2     ServFail      Server Failure                      [RFC1035]
+            Self::NXDomain => "Non-Existent Domain", // 3     NXDomain      Non-Existent Domain                 [RFC1035]
+            Self::NotImp => "Not Implemented", // 4     NotImp        Not Implemented                     [RFC1035]
+            Self::Refused => "Query Refused", // 5     Refused       Query Refused                       [RFC1035]
+            Self::YXDomain => "Name should not exist", // 6     YXDomain      Name Exists when it should not      [RFC2136][RFC6672]
+            Self::YXRRSet => "RR Set should not exist", // 7     YXRRSet       RR Set Exists when it should not    [RFC2136]
+            Self::NXRRSet => "RR Set does not exist", // 8     NXRRSet       RR Set that should exist does not   [RFC2136]
+            Self::NotAuth => "Not authorized", // 9     NotAuth       Server Not Authoritative for zone   [RFC2136]
+            Self::NotZone => "Name not in zone", // 10    NotZone       Name not contained in zone          [RFC2136]
+            Self::BADVERS => "Bad option versions", // 16    BADVERS       Bad OPT Version                     [RFC6891]
+            Self::BADSIG => "TSIG Failure", // 16    BADSIG        TSIG Signature Failure              [RFC2845]
+            Self::BADKEY => "Key not recognized", // 17    BADKEY        Key not recognized                  [RFC2845]
+            Self::BADTIME => "Signature out of time window", // 18    BADTIME       Signature out of time window        [RFC2845]
+            Self::BADMODE => "Bad TKEY mode", // 19    BADMODE       Bad TKEY Mode                       [RFC2930]
+            Self::BADNAME => "Duplicate key name", // 20    BADNAME       Duplicate key name                  [RFC2930]
+            Self::BADALG => "Algorithm not supported", // 21    BADALG        Algorithm not supported             [RFC2930]
+            Self::BADTRUNC => "Bad truncation", // 22    BADTRUNC      Bad Truncation                      [RFC4635]
+            Self::BADCOOKIE => "Bad server cookie", // 23    BADCOOKIE (TEMPORARY - registered 2015-07-26, expires 2016-07-26)    Bad/missing server cookie    [draft-ietf-dnsop-cookies]
+            Self::Unknown(_) => "Unknown response code",
         }
     }
 }
@@ -197,8 +200,7 @@ impl Display for ResponseCode {
 /// Convert from `ResponseCode` to `u16`
 ///
 /// ```
-/// use std::convert::From;
-/// use trust_dns_proto::op::response_code::ResponseCode;
+/// use hickory_proto::op::response_code::ResponseCode;
 ///
 /// let var: ResponseCode = From::from(0);
 /// assert_eq!(ResponseCode::NoError, var);
@@ -242,8 +244,7 @@ impl From<ResponseCode> for u16 {
 /// Convert from `u16` to `ResponseCode`
 ///
 /// ```
-/// use std::convert::From;
-/// use trust_dns_proto::op::response_code::ResponseCode;
+/// use hickory_proto::op::response_code::ResponseCode;
 ///
 /// let var: u16 = From::from(ResponseCode::NoError);
 /// assert_eq!(0, var);

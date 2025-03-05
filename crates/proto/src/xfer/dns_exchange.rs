@@ -1,29 +1,30 @@
 // Copyright 2015-2018 Benjamin Fry <benjaminfry@me.com>
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
 //! This module contains all the types for demuxing DNS oriented streams.
 
-use std::marker::PhantomData;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use core::future::Future;
+use core::marker::PhantomData;
+use core::pin::Pin;
+use core::task::{Context, Poll};
 
 use futures_channel::mpsc;
-use futures_util::future::{Future, FutureExt};
+use futures_util::future::FutureExt;
 use futures_util::stream::{Peekable, Stream, StreamExt};
-use log::{debug, warn};
+use tracing::debug;
 
 use crate::error::*;
-use crate::xfer::dns_handle::DnsHandle;
+use crate::runtime::Time;
 use crate::xfer::DnsResponseReceiver;
+use crate::xfer::dns_handle::DnsHandle;
 use crate::xfer::{
-    BufDnsRequestStreamHandle, DnsRequest, DnsRequestSender, DnsResponse, OneshotDnsRequest,
-    CHANNEL_BUFFER_SIZE,
+    BufDnsRequestStreamHandle, CHANNEL_BUFFER_SIZE, DnsRequest, DnsRequestSender, DnsResponse,
+    OneshotDnsRequest,
 };
-use crate::Time;
 
 /// This is a generic Exchange implemented over multiplexed DNS connection providers.
 ///
@@ -83,6 +84,16 @@ impl DnsExchange {
 
         DnsExchangeConnect::connect(connect_future, outbound_messages, message_sender)
     }
+
+    /// Returns a future that returns an error immediately.
+    pub fn error<F, S, TE>(error: ProtoError) -> DnsExchangeConnect<F, S, TE>
+    where
+        F: Future<Output = Result<S, ProtoError>> + 'static + Send + Unpin,
+        S: DnsRequestSender + 'static + Send + Unpin,
+        TE: Time + Unpin,
+    {
+        DnsExchangeConnect(DnsExchangeConnectInner::Error(error))
+    }
 }
 
 impl Clone for DnsExchange {
@@ -95,9 +106,8 @@ impl Clone for DnsExchange {
 
 impl DnsHandle for DnsExchange {
     type Response = DnsExchangeSend;
-    type Error = ProtoError;
 
-    fn send<R: Into<DnsRequest> + Unpin + Send + 'static>(&mut self, request: R) -> Self::Response {
+    fn send<R: Into<DnsRequest> + Unpin + Send + 'static>(&self, request: R) -> Self::Response {
         DnsExchangeSend {
             result: self.sender.send(request),
             _sender: self.sender.clone(), // TODO: this shouldn't be necessary, currently the presence of Senders is what allows the background to track current users, it generally is dropped right after send, this makes sure that there is at least one active after send
@@ -179,7 +189,10 @@ where
                     return Poll::Ready(Ok(()));
                 }
                 Poll::Ready(Some(Err(err))) => {
-                    warn!("io_stream hit an error, shutting down: {}", err);
+                    debug!(
+                        error = err.as_dyn(),
+                        "io_stream hit an error, shutting down"
+                    );
 
                     return Poll::Ready(Err(err));
                 }
@@ -199,7 +212,7 @@ where
                     match serial_response.send_response(io_stream.send_message(dns_request)) {
                         Ok(()) => (),
                         Err(_) => {
-                            warn!("failed to associate send_message response to the sender");
+                            debug!("failed to associate send_message response to the sender");
                         }
                     }
                 }
@@ -220,7 +233,7 @@ where
 
 /// A wrapper for a future DnsExchange connection.
 ///
-/// DnsExchangeConnect is clonable, making it possible to share this if the connection
+/// DnsExchangeConnect is cloneable, making it possible to share this if the connection
 ///  will be shared across threads.
 ///
 /// The future will return a tuple of the DnsExchange (for sending messages) and a background
@@ -284,6 +297,7 @@ where
         error: ProtoError,
         outbound_messages: mpsc::Receiver<OneshotDnsRequest>,
     },
+    Error(ProtoError),
 }
 
 #[allow(clippy::type_complexity)]
@@ -298,11 +312,11 @@ where
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
             let next;
-            match *self {
-                DnsExchangeConnectInner::Connecting {
-                    ref mut connect_future,
-                    ref mut outbound_messages,
-                    ref mut sender,
+            match &mut *self {
+                Self::Connecting {
+                    connect_future,
+                    outbound_messages,
+                    sender,
                 } => {
                     let connect_future = Pin::new(connect_future);
                     match connect_future.poll(cx) {
@@ -324,7 +338,7 @@ where
                         }
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(Err(error)) => {
-                            debug!("stream errored while connecting: {:?}", error);
+                            debug!(error = error.as_dyn(), "stream errored while connecting");
                             next = Self::FailAll {
                                 error,
                                 outbound_messages: outbound_messages
@@ -334,18 +348,18 @@ where
                         }
                     };
                 }
-                DnsExchangeConnectInner::Connected {
-                    ref exchange,
-                    ref mut background,
+                Self::Connected {
+                    exchange,
+                    background,
                 } => {
                     let exchange = exchange.clone();
                     let background = background.take().expect("cannot poll after complete");
 
                     return Poll::Ready(Ok((exchange, background)));
                 }
-                DnsExchangeConnectInner::FailAll {
-                    ref error,
-                    ref mut outbound_messages,
+                Self::FailAll {
+                    error,
+                    outbound_messages,
                 } => {
                     while let Some(outbound_message) = match outbound_messages.poll_next_unpin(cx) {
                         Poll::Ready(opt) => opt,
@@ -361,6 +375,7 @@ where
 
                     return Poll::Ready(Err(error.clone()));
                 }
+                Self::Error(error) => return Poll::Ready(Err(error.clone())),
             }
 
             *self = next;

@@ -1,13 +1,18 @@
 // Copyright 2015-2021 Benjamin Fry <benjaminfry@me.com>
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
 //! Message metadata
 
-use std::{convert::From, fmt};
+#[cfg(test)]
+use alloc::vec::Vec;
+use core::{convert::From, fmt};
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 use crate::{
     error::*,
@@ -48,6 +53,7 @@ use crate::{
 /// ```
 ///
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 pub struct Header {
     id: u16,
     message_type: MessageType,
@@ -69,10 +75,12 @@ impl fmt::Display for Header {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         write!(
             f,
-            "{id}:{flags}:{code:?}:{answers}/{authorities}/{additionals}",
+            "{id}:{message_type}:{flags}:{code:?}:{op_code}:{answers}/{authorities}/{additionals}",
             id = self.id,
+            message_type = self.message_type,
             flags = self.flags(),
             code = self.response_code,
+            op_code = self.op_code,
             answers = self.answer_count,
             authorities = self.name_server_count,
             additionals = self.additional_count,
@@ -82,6 +90,7 @@ impl fmt::Display for Header {
 
 /// Message types are either Query (also Update) or Response
 #[derive(Debug, PartialEq, Eq, PartialOrd, Copy, Clone, Hash)]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 pub enum MessageType {
     /// Queries are Client requests, these are either Queries or Updates
     Query,
@@ -92,8 +101,8 @@ pub enum MessageType {
 impl fmt::Display for MessageType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         let s = match self {
-            MessageType::Query => "QUERY",
-            MessageType::Response => "RESPONSE",
+            Self::Query => "QUERY",
+            Self::Response => "RESPONSE",
         };
 
         f.write_str(s)
@@ -176,7 +185,7 @@ impl Header {
     /// Construct a new header based off the request header. This copies over the RD (recursion-desired)
     ///   and CD (checking-disabled), as well as the op_code and id of the request.
     ///
-    /// See https://datatracker.ietf.org/doc/html/rfc6895#section-2
+    /// See <https://datatracker.ietf.org/doc/html/rfc6895#section-2>
     ///
     /// ```text
     /// The AA, TC, RD, RA, and CD bits are each theoretically meaningful
@@ -260,13 +269,13 @@ impl Header {
         self
     }
 
-    /// Specifies that the data is authentic, i.e. the resolver believes all data to be valid through DNSSec
+    /// Specifies that the data is authentic, i.e. the resolver believes all data to be valid through DNSSEC
     pub fn set_authentic_data(&mut self, authentic_data: bool) -> &mut Self {
         self.authentic_data = authentic_data;
         self
     }
 
-    /// Used during recursive resolution to specified if a resolver should or should not validate DNSSec signatures
+    /// Used during recursive resolution to specified if a resolver should or should not validate DNSSEC signatures
     pub fn set_checking_disabled(&mut self, checking_disabled: bool) -> &mut Self {
         self.checking_disabled = checking_disabled;
         self
@@ -449,7 +458,7 @@ impl Header {
     /// # Return value
     ///
     /// If this is a query, this will return the number of queries in the query section of the
-    //   message, fo updates this represents the zone count (must be no more than 1).
+    //   message, for updates this represents the zone count (must be no more than 1).
     pub fn query_count(&self) -> u16 {
         self.query_count
     }
@@ -555,7 +564,7 @@ impl<'r> BinDecodable<'r> for Header {
             MessageType::Query
         };
         // the 4bit opcode, masked and then shifted right 3bits for the u8...
-        let op_code: OpCode = OpCode::from_u8((0b0111_1000 & q_opcd_a_t_r) >> 3)?;
+        let op_code = OpCode::from_u8((0b0111_1000 & q_opcd_a_t_r) >> 3);
         let authoritative = (0b0000_0100 & q_opcd_a_t_r) == 0b0000_0100;
         let truncation = (0b0000_0010 & q_opcd_a_t_r) == 0b0000_0010;
         let recursion_desired = (0b0000_0001 & q_opcd_a_t_r) == 0b0000_0001;

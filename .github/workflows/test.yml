@@ -5,192 +5,264 @@ on:
     branches:
       - main
       - release/**
+      - "*_dev"
+    # does not work properly due to an issue in GitHub's branch protection
+    # rules: https://github.com/orgs/community/discussions/13690
+    # paths-ignore:
+    #   - "conformance/**"
   pull_request:
     branches:
       - main
       - release/**
+    # paths-ignore:
+    #   - "conformance/**"
+  merge_group:
   schedule:
-    - cron:  '0 3 * * 4'
+    - cron: "0 3 * * 4"
 
 env:
-  CARGO_MAKE_VERSION: '0.34.0'
+  CARGO_WS_VERSION: "0.3.6"
 
 jobs:
   ## Run all default oriented feature sets across all platforms.
   platform-matrix:
     name: platform
     runs-on: ${{ matrix.os }}
+    continue-on-error: true
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      RUST_LOG: info
     steps:
-    - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
-    - uses: actions-rs/toolchain@v1
-      with:
-        profile: minimal
-        toolchain: stable
-        override: true
-    - uses: davidB/rust-cargo-make@v1
-      with:
-        version: ${{ env.CARGO_MAKE_VERSION }}
+      - uses: dtolnay/rust-toolchain@stable
 
-    - name: cargo make all-features
-      run: cargo make all-features
+      - uses: extractions/setup-just@v2
 
-    - name: target/kcov cache
-      uses: actions/cache@v2
-      with:
-        path: target/kcov
-        key: ${{ runner.os }}-kcov-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-kcov-${{ hashFiles('**/Cargo.toml') }}
-          ${{ runner.os }}-kcov
+      - name: install cargo-binstall
+        uses: cargo-bins/cargo-binstall@v1.11.2
+      - name: install cargo-workspaces
+        run: cargo binstall cargo-workspaces -y --version ${{ env.CARGO_WS_VERSION }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: cargo make coverage
-      run: cargo make coverage --env="FEATURES=--all-features"
+      - name: just all-features
+        run: just all-features
 
-    - name: upload coverage
-      if: matrix.os == 'ubuntu-latest'
-      uses: codecov/codecov-action@v1
-      with:
-        token: ${{ secrets.CODECOV_TOKEN }}
+      - name: just test-docs
+        if: ${{ !cancelled() && matrix.os != 'windows-latest' }} # uses all features, avoid openssl
+        run: just test-docs
+
+  wasm:
+    name: wasm
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+
+      - name: check
+        run: cargo check -p hickory-proto --target wasm32-wasip1 --no-default-features
+
+  ## Measure test coverage, only on linux.
+  code-coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+
+      - uses: extractions/setup-just@v2
+
+      - name: cargo install cargo-llvm-cov
+        uses: baptiste0928/cargo-install@v3
+        with:
+          crate: cargo-llvm-cov
+
+      - name: just coverage
+        run: just coverage
+
+      - name: upload coverage
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          verbose: true
+          #files: coverage/hickory-dns-coverage.json
 
   ## Work through all of the variations of the different features, only on linux to save concurrent resources
   exhaustive-features-matrix:
     name: exhaustive
-    # Let's wait for the all-features cache
-    needs: platform-matrix
     runs-on: ubuntu-latest
+    continue-on-error: true
     strategy:
       matrix:
-      #   feature: [default-features, no-default-features, dns-over-rustls, dns-over-https-rustls, dns-over-native-tls, dns-over-openssl, dnssec-openssl, dnssec-ring, mdns, async-std]
-        feature: [default-features, no-default-features, dns-over-rustls, dns-over-https-rustls, dns-over-native-tls, dnssec-openssl, dnssec-ring, mdns, async-std]
+        feature:
+          [
+            default,
+            no-default-features,
+            tls-aws-lc-rs,
+            https-aws-lc-rs,
+            quic-aws-lc-rs,
+            h3-aws-lc-rs,
+            tls-ring,
+            https-ring,
+            quic-ring,
+            h3-ring,
+            dnssec-aws-lc-rs,
+            dnssec-ring,
+            async-std,
+            doc,
+          ]
+    env:
+      RUST_LOG: info
     steps:
-    - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
-    - uses: actions-rs/toolchain@v1
-      with:
-        profile: minimal
-        toolchain: stable
-        override: true
-    - uses: davidB/rust-cargo-make@v1
-      with:
-        version: ${{ env.CARGO_MAKE_VERSION }}
+      - uses: dtolnay/rust-toolchain@stable
 
-    - name: cargo make
-      run: cargo make ${{ matrix.feature }}
+      - uses: extractions/setup-just@v2
 
-    - name: target/kcov cache
-      uses: actions/cache@v2
-      with:
-        path: target/kcov
-        key: ${{ runner.os }}-kcov-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-kcov-${{ hashFiles('**/Cargo.toml') }}
-          ${{ runner.os }}-kcov
+      - name: install cargo-binstall
+        uses: cargo-bins/cargo-binstall@v1.11.2
+      - name: install cargo-workspaces
+        run: cargo binstall cargo-workspaces -y --version ${{ env.CARGO_WS_VERSION }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: cargo make coverage
-      run: cargo make coverage --env=FEATURES="--features ${{ matrix.feature }}"
+      - name: just
+        run: just ${{ matrix.feature }}
 
-    - name: upload coverage
-      uses: codecov/codecov-action@v1
-      with:
-        token: ${{ secrets.CODECOV_TOKEN }}
+  check-all-features-matrix:
+    name: cargo-all-features
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      matrix:
+        chunk:
+          - 1
+          - 2
+          - 3
+          - 4
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo install cargo-all-features
+        uses: baptiste0928/cargo-install@v3
+        with:
+          crate: cargo-all-features
+          version: 1.10.0
+
+      - name: cargo check-all-features
+        run: cargo check-all-features --n-chunks 4 --chunk ${{ matrix.chunk }}
 
   ## Check past and future versions
   ##   this enforces the minimum version of rust this project works with
   past-future-matrix:
     name: past-future
-    # Let's wait for the all-features cache
-    needs: platform-matrix
     runs-on: ubuntu-latest
+    continue-on-error: true
     strategy:
       matrix:
-        version: ['1.54.0', beta, nightly]
+        version: ["1.71.1", beta, "nightly-2025-01-19"]
     steps:
-    - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
-    - uses: actions-rs/toolchain@v1
-      with:
-        profile: minimal
-        toolchain: ${{ matrix.version }}
-        override: true
-    - uses: davidB/rust-cargo-make@v1
-      with:
-        version: ${{ env.CARGO_MAKE_VERSION }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.version }}
 
-    - name: cargo make no-default-features
-      run: cargo make no-default-features
+      - uses: extractions/setup-just@v2
 
-    - name: cargo make build-bench
-      if: matrix.version == 'nightly'
-      run: cargo make build-bench
+      - name: install cargo-binstall
+        uses: cargo-bins/cargo-binstall@v1.11.2
+      - name: install cargo-workspaces
+        run: cargo binstall cargo-workspaces -y --version ${{ env.CARGO_WS_VERSION }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: just no-default-features
+        run: just no-default-features
+
+      - name: just build-bench
+        if: contains( matrix.version, 'nightly' )
+        run: just build-bench
 
   ## Execute the clippy checks
   cleanliness:
     name: cleanliness
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
-    - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
-    # not using the cargo cache here, since this differs significantly
-    - name: cargo-all cache
-      uses: actions/cache@v2
-      with:
-        path: ~/.cargo
-        key: ${{ runner.os }}-cargo-all-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-cargo-all-${{ hashFiles('**/Cargo.toml') }}
-          ${{ runner.os }}-cargo-all
-          ${{ runner.os }}-cargo
+      # not using the cargo cache here, since this differs significantly
+      - name: cargo-all cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo
+          key: ${{ runner.os }}-cargo-all-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-all-${{ hashFiles('**/Cargo.toml') }}
+            ${{ runner.os }}-cargo-all
+            ${{ runner.os }}-cargo
 
-    - uses: actions-rs/toolchain@v1
-      with:
-        profile: minimal
-        toolchain: stable
-        components: rustfmt, clippy
-        override: true
-    - uses: davidB/rust-cargo-make@v1
-      with:
-        version: ${{ env.CARGO_MAKE_VERSION }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
 
-    # Clippy
-    - name: cargo make clippy
-      run: cargo make clippy
-    # Rustfmt
-    - name: cargo make fmt
-      run: cargo make fmt
-    # Audit
-    - name: cargo audit
-      run: cargo make audit
+      - uses: extractions/setup-just@v2
+
+      - name: install cargo-binstall
+        uses: cargo-bins/cargo-binstall@v1.11.2
+      - name: install cargo-workspaces
+        run: cargo binstall cargo-workspaces -y --version ${{ env.CARGO_WS_VERSION }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Clippy
+      - name: just clippy
+        run: just clippy
+      # Rustfmt
+      - name: just fmt
+        if: ${{ !cancelled() }}
+        run: just fmt
+      # Audit
+      - name: cargo audit
+        if: ${{ !cancelled() }}
+        run: just audit
 
   # Build and run bind to test our compatibility with standard name servers
   compatibility:
     name: compatibility
-    # wait for the cache from all-features
-    needs: platform-matrix
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
-    - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
-    - uses: actions-rs/toolchain@v1
-      with:
-        profile: minimal
-        toolchain: stable
-        override: true
-    - uses: davidB/rust-cargo-make@v1
-      with:
-        version: ${{ env.CARGO_MAKE_VERSION }}
+      - uses: dtolnay/rust-toolchain@stable
 
-    - name: target/bind cache
-      uses: actions/cache@v2
-      with:
-        path: target/bind
-        key: ${{ runner.os }}-bind-${{ hashFiles('**/Makefile.toml') }}
-        restore-keys: |
-          ${{ runner.os }}-bind-${{ hashFiles('**/Makefile.toml') }}
-          ${{ runner.os }}-bind
+      - uses: extractions/setup-just@v2
 
-    - name: cargo make bind-compatibility
-      run: cargo make bind-compatibility
+      - name: target/bind cache
+        uses: actions/cache@v4
+        with:
+          path: target/bind
+          key: ${{ runner.os }}-bind-${{ hashFiles('**/justfile') }}
+          restore-keys: |
+            ${{ runner.os }}-bind-${{ hashFiles('**/justfile') }}
+            ${{ runner.os }}-bind
+
+      - name: just compatibility
+        run: just compatibility

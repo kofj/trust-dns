@@ -2,8 +2,8 @@
 // Copyright 2017 Google LLC.
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
 #![allow(dead_code)]
@@ -11,11 +11,11 @@
 use std::env;
 use std::fs;
 use std::fs::DirBuilder;
-use std::io::{stdout, BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write, stdout};
 use std::path::Path;
 use std::process::Child;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use data_encoding::BASE32;
@@ -43,7 +43,7 @@ pub struct NamedProcess {
 
 impl Drop for NamedProcess {
     fn drop(&mut self) {
-        if let Some(ref mut named) = self.named {
+        if let Some(named) = &mut self.named {
             named.kill().expect("could not kill process");
             named.wait().expect("waiting failed");
         }
@@ -65,7 +65,7 @@ fn new_working_dir() -> String {
         (rand >> 16) as u8,
         (rand >> 24) as u8,
     ]);
-    let working_dir = format!("{}/bind_pwd_{}", target_dir, rand);
+    let working_dir = format!("{target_dir}/bind_pwd_{rand}");
 
     if !Path::new(&working_dir).exists() {
         DirBuilder::new()
@@ -95,7 +95,7 @@ where
             .expect("could not read stdout");
 
         if !output.is_empty() {
-            print!("SRV: {}", output);
+            print!("SRV: {output}");
         }
 
         if output.ends_with(started_str) {

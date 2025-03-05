@@ -3,12 +3,13 @@
 //! This example shows how to create a resolver that uses the tokio multithreaded runtime. This is how
 //! you might integrate the resolver into a more complex application.
 
-#[cfg(feature = "tokio-runtime")]
 fn main() {
-    use tokio::runtime::Runtime;
-    use trust_dns_resolver::{TokioAsyncResolver, TokioHandle};
+    tracing_subscriber::fmt::init();
+    run();
+}
 
-    env_logger::init();
+fn run() {
+    use tokio::runtime::Runtime;
 
     // Set up the standard tokio runtime (multithreaded by default).
     let runtime = Runtime::new().expect("Failed to create runtime");
@@ -17,25 +18,26 @@ fn main() {
         // To make this independent, if targeting macOS, BSD, Linux, or Windows, we can use the system's configuration:
         #[cfg(any(unix, windows))]
         {
+            use hickory_resolver::{TokioResolver, name_server::TokioConnectionProvider};
+
             // use the system resolver configuration
-            TokioAsyncResolver::from_system_conf(TokioHandle)
+            TokioResolver::from_system_conf(TokioConnectionProvider::default())
+                .expect("failed to create resolver")
         }
 
         // For other operating systems, we can use one of the preconfigured definitions
         #[cfg(not(any(unix, windows)))]
         {
             // Directly reference the config types
-            use trust_dns_resolver::config::{ResolverConfig, ResolverOpts};
+            use hickory_resolver::{
+                Resolver,
+                config::{ResolverConfig, ResolverOpts},
+            };
 
             // Get a new resolver with the google nameservers as the upstream recursive resolvers
-            AsyncResolver::new(
-                ResolverConfig::google(),
-                ResolverOpts::default(),
-                runtime.handle().clone(),
-            )
+            Resolver::tokio(ResolverConfig::google(), ResolverOpts::default())
         }
-    }
-    .expect("failed to create resolver");
+    };
 
     // Create some futures representing name lookups.
     let names = &["www.google.com", "www.reddit.com", "www.wikipedia.org"];
@@ -51,7 +53,7 @@ fn main() {
             .expect("Failed completing lookup future")
             .iter()
             .collect::<Vec<_>>();
-        println!("{} resolved to {:?}", name, ips);
+        println!("{name} resolved to {ips:?}");
     }
 
     // Drop the resolver, which means that the runtime will become idle.
@@ -59,7 +61,8 @@ fn main() {
     drop(resolver);
 }
 
-#[cfg(not(feature = "tokio-runtime"))]
-fn main() {
-    println!("tokio-runtime feature must be enabled")
+#[test]
+fn test_multithreaded_runtime() {
+    test_support::subscribe();
+    run()
 }

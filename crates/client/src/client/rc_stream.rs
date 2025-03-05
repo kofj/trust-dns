@@ -1,8 +1,8 @@
 // Copyright 2015-2016 Benjamin Fry <benjaminfry@me.com>
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
 use std::pin::Pin;
@@ -11,7 +11,7 @@ use std::task::{Context, Poll};
 
 use futures_util::lock::Mutex;
 use futures_util::stream::{Fuse, Stream, StreamExt};
-use futures_util::{ready, FutureExt};
+use futures_util::{FutureExt, ready};
 
 #[allow(clippy::type_complexity)]
 #[must_use = "stream do nothing unless polled"]
@@ -61,7 +61,7 @@ where
         match stream.poll_next_unpin(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(result) => {
-                if let Some(ref result) = result {
+                if let Some(result) = &result {
                     stored_result.push(result.clone());
                 }
                 Poll::Ready(result)
@@ -89,8 +89,8 @@ mod tests {
     use futures::future;
     use futures_util::stream::once;
 
-    use crate::proto::error::{ProtoError, ProtoErrorKind};
     use crate::proto::xfer::FirstAnswer;
+    use crate::proto::{ProtoError, ProtoErrorKind};
 
     use super::*;
 

@@ -1,81 +1,78 @@
-// Copyright 2015-2017 Benjamin Fry <benjaminfry@me.com>
+// Copyright 2015-2023 Benjamin Fry <benjaminfry@me.com>
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
 //! Caching related functionality for the Resolver.
 
-use std::borrow::Cow;
-use std::error::Error;
-use std::net::{Ipv4Addr, Ipv6Addr};
-use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
-use std::time::Instant;
+use std::{borrow::Cow, future::Future, pin::Pin, sync::Arc, time::Instant};
 
-use futures_util::future::Future;
+use futures_util::future::TryFutureExt;
+use once_cell::sync::Lazy;
 
-use proto::error::ProtoError;
-use proto::op::{Query, ResponseCode};
-use proto::rr::domain::usage::{
-    ResolverUsage, DEFAULT, INVALID, IN_ADDR_ARPA_127, IP6_ARPA_1, LOCAL,
-    LOCALHOST as LOCALHOST_usage, ONION,
+use crate::{
+    dns_lru::{self, DnsLru, TtlConfig},
+    error::ResolveError,
+    lookup::Lookup,
+    proto::{
+        op::{Query, ResponseCode},
+        rr::{
+            DNSClass, Name, RData, Record, RecordType,
+            domain::usage::{
+                DEFAULT, IN_ADDR_ARPA_127, INVALID, IP6_ARPA_1, LOCAL,
+                LOCALHOST as LOCALHOST_usage, ONION, ResolverUsage,
+            },
+            rdata::{A, AAAA, CNAME, PTR, SOA},
+            resource::RecordRef,
+        },
+        xfer::{DnsHandle, DnsRequestOptions, DnsResponse, FirstAnswer},
+        {ForwardNSData, ProtoError, ProtoErrorKind},
+    },
 };
-use proto::rr::rdata::SOA;
-use proto::rr::{DNSClass, Name, RData, Record, RecordType};
-use proto::xfer::{DnsHandle, DnsRequestOptions, DnsResponse, FirstAnswer};
 
-use crate::dns_lru::DnsLru;
-use crate::dns_lru::{self, TtlConfig};
-use crate::error::*;
-use crate::lookup::Lookup;
+static LOCALHOST: Lazy<RData> =
+    Lazy::new(|| RData::PTR(PTR(Name::from_ascii("localhost.").unwrap())));
+static LOCALHOST_V4: Lazy<RData> = Lazy::new(|| RData::A(A::new(127, 0, 0, 1)));
+static LOCALHOST_V6: Lazy<RData> = Lazy::new(|| RData::AAAA(AAAA::new(0, 0, 0, 0, 0, 0, 0, 1)));
 
-const MAX_QUERY_DEPTH: u8 = 8; // arbitrarily chosen number...
-
-lazy_static! {
-    static ref LOCALHOST: RData = RData::PTR(Name::from_ascii("localhost.").unwrap());
-    static ref LOCALHOST_V4: RData = RData::A(Ipv4Addr::new(127, 0, 0, 1));
-    static ref LOCALHOST_V6: RData = RData::AAAA(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1));
-}
-
+/// Counts the depth of CNAME query resolutions.
+#[derive(Default, Clone, Copy)]
 struct DepthTracker {
-    query_depth: Arc<AtomicU8>,
+    query_depth: u8,
 }
 
 impl DepthTracker {
-    fn track(query_depth: Arc<AtomicU8>) -> Self {
-        query_depth.fetch_add(1, Ordering::Release);
-        Self { query_depth }
+    fn nest(self) -> Self {
+        Self {
+            query_depth: self.query_depth + 1,
+        }
     }
-}
 
-impl Drop for DepthTracker {
-    fn drop(&mut self) {
-        self.query_depth.fetch_sub(1, Ordering::Release);
+    fn is_exhausted(self) -> bool {
+        self.query_depth + 1 >= Self::MAX_QUERY_DEPTH
     }
+
+    const MAX_QUERY_DEPTH: u8 = 8; // arbitrarily chosen number...
 }
 
 // TODO: need to consider this storage type as it compares to Authority in server...
 //       should it just be an variation on Authority?
 #[derive(Clone, Debug)]
 #[doc(hidden)]
-pub struct CachingClient<C, E>
+pub struct CachingClient<C>
 where
-    C: DnsHandle<Error = E>,
-    E: Into<ResolveError> + From<ProtoError> + Error + Clone + Send + Unpin + 'static,
+    C: DnsHandle,
 {
     lru: DnsLru,
     client: C,
-    query_depth: Arc<AtomicU8>,
     preserve_intermediates: bool,
 }
 
-impl<C, E> CachingClient<C, E>
+impl<C> CachingClient<C>
 where
-    C: DnsHandle<Error = E> + Send + 'static,
-    E: Into<ResolveError> + From<ProtoError> + Error + Clone + Send + Unpin + 'static,
+    C: DnsHandle + Send + 'static,
 {
     #[doc(hidden)]
     pub fn new(max_size: usize, client: C, preserve_intermediates: bool) -> Self {
@@ -87,11 +84,9 @@ where
     }
 
     pub(crate) fn with_cache(lru: DnsLru, client: C, preserve_intermediates: bool) -> Self {
-        let query_depth = Arc::new(AtomicU8::new(0));
         Self {
             lru,
             client,
-            query_depth,
             preserve_intermediates,
         }
     }
@@ -102,7 +97,16 @@ where
         query: Query,
         options: DnsRequestOptions,
     ) -> Pin<Box<dyn Future<Output = Result<Lookup, ResolveError>> + Send>> {
-        Box::pin(Self::inner_lookup(query, options, self.clone(), vec![]))
+        Box::pin(
+            Self::inner_lookup(
+                query,
+                options,
+                self.clone(),
+                vec![],
+                DepthTracker::default(),
+            )
+            .map_err(ResolveError::from),
+        )
     }
 
     async fn inner_lookup(
@@ -110,7 +114,8 @@ where
         options: DnsRequestOptions,
         mut client: Self,
         preserved_records: Vec<(Record, u32)>,
-    ) -> Result<Lookup, ResolveError> {
+        depth: DepthTracker,
+    ) -> Result<Lookup, ProtoError> {
         // see https://tools.ietf.org/html/rfc6761
         //
         // ```text
@@ -139,40 +144,39 @@ where
                     RecordType::AAAA => return Ok(Lookup::from_rdata(query, LOCALHOST_V6.clone())),
                     RecordType::PTR => return Ok(Lookup::from_rdata(query, LOCALHOST.clone())),
                     _ => {
-                        return Err(ResolveError::nx_error(
-                            query,
+                        return Err(ProtoError::nx_error(
+                            Box::new(query),
+                            None,
                             None,
                             None,
                             ResponseCode::NoError,
                             false,
-                        ))
+                            None,
+                        ));
                     } // Are there any other types we can use?
                 },
-                // when mdns is enabled we will follow a standard query path
-                #[cfg(feature = "mdns")]
-                ResolverUsage::LinkLocal => (),
                 // TODO: this requires additional config, as Kubernetes and other systems misuse the .local. zone.
                 // when mdns is not enabled we will return errors on LinkLocal ("*.local.") names
-                #[cfg(not(feature = "mdns"))]
                 ResolverUsage::LinkLocal => (),
                 ResolverUsage::NxDomain => {
-                    return Err(ResolveError::nx_error(
-                        query,
+                    return Err(ProtoError::nx_error(
+                        Box::new(query),
+                        None,
                         None,
                         None,
                         ResponseCode::NXDomain,
                         false,
-                    ))
+                        None,
+                    ));
                 }
                 ResolverUsage::Normal => (),
             }
         }
 
-        let _tracker = DepthTracker::track(client.query_depth.clone());
         let is_dnssec = client.client.is_verifying_dnssec();
 
         // first transition any polling that is needed (mutable refs...)
-        if let Some(cached_lookup) = client.from_cache(&query) {
+        if let Some(cached_lookup) = client.lookup_from_cache(&query) {
             return cached_lookup;
         };
 
@@ -180,43 +184,45 @@ where
             .client
             .lookup(query.clone(), options)
             .first_answer()
-            .await
-            .map_err(E::into);
+            .await;
 
         // TODO: technically this might be duplicating work, as name_server already performs this evaluation.
         //  we may want to create a new type, if evaluated... but this is most generic to support any impl in LookupState...
         let response_message = if let Ok(response) = response_message {
-            ResolveError::from_response(response, false)
+            ProtoError::from_response(response, false)
         } else {
             response_message
         };
 
         // TODO: take all records and cache them?
-        //  if it's DNSSec they must be signed, otherwise?
-        let records: Result<Records, ResolveError> = match response_message {
+        //  if it's DNSSEC they must be signed, otherwise?
+        let records: Result<Records, ProtoError> = match response_message {
             // this is the only cacheable form
-            Err(ResolveError {
-                kind:
-                    ResolveErrorKind::NoRecordsFound {
+            Err(e) => {
+                match e.kind() {
+                    ProtoErrorKind::NoRecordsFound {
                         query,
                         soa,
                         negative_ttl,
                         response_code,
                         trusted,
-                    },
-                ..
-            }) => {
-                Err(Self::handle_nxdomain(
-                    is_dnssec,
-                    false, /*tbd*/
-                    *query,
-                    soa.map(|v| *v),
-                    negative_ttl,
-                    response_code,
-                    trusted,
-                ))
+                        ns,
+                        ..
+                    } => {
+                        Err(Self::handle_nxdomain(
+                            is_dnssec,
+                            false, /*tbd*/
+                            query.as_ref().clone(),
+                            soa.as_ref().map(Box::as_ref).cloned(),
+                            ns.clone(),
+                            *negative_ttl,
+                            *response_code,
+                            *trusted,
+                        ))
+                    }
+                    _ => return Err(e),
+                }
             }
-            Err(e) => return Err(e),
             Ok(response_message) => {
                 // allow the handle_noerror function to deal with any error codes
                 let records = Self::handle_noerror(
@@ -226,6 +232,7 @@ where
                     &query,
                     response_message,
                     preserved_records,
+                    depth,
                 )?;
 
                 Ok(records)
@@ -237,14 +244,17 @@ where
             Ok(Records::CnameChain {
                 next: future,
                 min_ttl: ttl,
-            }) => client.cname(future.await?, query, ttl),
+            }) => match future.await {
+                Ok(lookup) => client.cname(lookup, query, ttl),
+                Err(e) => client.cache(query, Err(e)),
+            },
             Ok(Records::Exists(rdata)) => client.cache(query, Ok(rdata)),
             Err(e) => client.cache(query, Err(e)),
         }
     }
 
     /// Check if this query is already cached
-    fn from_cache(&self, query: &Query) -> Option<Result<Lookup, ResolveError>> {
+    fn lookup_from_cache(&self, query: &Query) -> Option<Result<Lookup, ProtoError>> {
         self.lru.get(query, Instant::now())
     }
 
@@ -254,7 +264,7 @@ where
     ///  and a record for the name, regardless of CNAME presence, what have you
     ///  ultimately does not exist.
     ///
-    /// This also handles empty responses in the same way. When performing DNSSec enabled queries, we should
+    /// This also handles empty responses in the same way. When performing DNSSEC enabled queries, we should
     ///  never enter here, and should never cache unless verified requests.
     ///
     /// TODO: should this should be expanded to do a forward lookup? Today, this will fail even if there are
@@ -263,35 +273,41 @@ where
     /// # Arguments
     ///
     /// * `message` - message to extract SOA, etc, from for caching failed requests
-    /// * `valid_nsec` - species that in DNSSec mode, this request is safe to cache
+    /// * `valid_nsec` - species that in DNSSEC mode, this request is safe to cache
     /// * `negative_ttl` - this should be the SOA minimum for negative ttl
+    #[allow(clippy::too_many_arguments)]
     fn handle_nxdomain(
         is_dnssec: bool,
         valid_nsec: bool,
         query: Query,
-        soa: Option<SOA>,
+        soa: Option<Record<SOA>>,
+        ns: Option<Arc<[ForwardNSData]>>,
         negative_ttl: Option<u32>,
         response_code: ResponseCode,
         trusted: bool,
-    ) -> ResolveError {
+    ) -> ProtoError {
         if valid_nsec || !is_dnssec {
             // only trust if there were validated NSEC records
-            ResolveErrorKind::NoRecordsFound {
+            ProtoErrorKind::NoRecordsFound {
                 query: Box::new(query),
                 soa: soa.map(Box::new),
+                ns,
                 negative_ttl,
                 response_code,
                 trusted: true,
+                authorities: None,
             }
             .into()
         } else {
             // not cacheable, no ttl...
-            ResolveErrorKind::NoRecordsFound {
+            ProtoErrorKind::NoRecordsFound {
                 query: Box::new(query),
                 soa: soa.map(Box::new),
+                ns,
                 negative_ttl: None,
                 response_code,
                 trusted,
+                authorities: None,
             }
             .into()
         }
@@ -303,14 +319,15 @@ where
         options: DnsRequestOptions,
         is_dnssec: bool,
         query: &Query,
-        mut response: DnsResponse,
+        response: DnsResponse,
         mut preserved_records: Vec<(Record, u32)>,
-    ) -> Result<Records, ResolveError> {
+        depth: DepthTracker,
+    ) -> Result<Records, ProtoError> {
         // initial ttl is what CNAMES for min usage
         const INITIAL_TTL: u32 = dns_lru::MAX_TTL;
 
         // need to capture these before the subsequent and destructive record processing
-        let soa = response.soa();
+        let soa = response.soa().as_ref().map(RecordRef::to_owned);
         let negative_ttl = response.negative_ttl();
         let response_code = response.response_code();
 
@@ -334,18 +351,18 @@ where
                         (Cow::Borrowed(query.name()), INITIAL_TTL, false),
                         |(search_name, cname_ttl, was_cname), r| {
                             match r.data() {
-                                Some(RData::CNAME(ref cname)) => {
+                                RData::CNAME(CNAME(cname)) => {
                                     // take the minimum TTL of the cname_ttl and the next record in the chain
                                     let ttl = cname_ttl.min(r.ttl());
-                                    debug_assert_eq!(r.rr_type(), RecordType::CNAME);
+                                    debug_assert_eq!(r.record_type(), RecordType::CNAME);
                                     if search_name.as_ref() == r.name() {
                                         return (Cow::Owned(cname.clone()), ttl, true);
                                     }
                                 }
-                                Some(RData::SRV(ref srv)) => {
+                                RData::SRV(srv) => {
                                     // take the minimum TTL of the cname_ttl and the next record in the chain
                                     let ttl = cname_ttl.min(r.ttl());
-                                    debug_assert_eq!(r.rr_type(), RecordType::SRV);
+                                    debug_assert_eq!(r.record_type(), RecordType::SRV);
 
                                     // the search name becomes the srv.target
                                     return (Cow::Owned(srv.target().clone()), ttl, true);
@@ -359,6 +376,7 @@ where
                 };
 
             // take all answers. // TODO: following CNAMES?
+            let mut response = response.into_message();
             let answers = response.take_answers();
             let additionals = response.take_additionals();
             let name_servers = response.take_name_servers();
@@ -371,8 +389,8 @@ where
             let records = answers
                 .into_iter()
                 // Chained records will generally exist in the additionals section
-                .chain(additionals.into_iter())
-                .chain(name_servers.into_iter())
+                .chain(additionals)
+                .chain(name_servers)
                 .filter_map(|r| {
                     // because this resolved potentially recursively, we want the min TTL from the chain
                     let ttl = cname_ttl.min(r.ttl());
@@ -381,29 +399,25 @@ where
                     if query.query_class() == r.dns_class() {
                         // standard evaluation, it's an any type or it's the requested type and the search_name matches
                         #[allow(clippy::suspicious_operation_groupings)]
-                        if (query.query_type().is_any() || query.query_type() == r.rr_type())
+                        if (query.query_type().is_any() || query.query_type() == r.record_type())
                             && (search_name.as_ref() == r.name() || query.name() == r.name())
                         {
                             found_name = true;
                             return Some((r, ttl));
                         }
-                        // CNAME evaluation, it's an A/AAAA lookup and the record is from the CNAME lookup chain.
-                        if client.preserve_intermediates
-                            && r.rr_type() == RecordType::CNAME
-                            && (query.query_type() == RecordType::A
-                                || query.query_type() == RecordType::AAAA)
-                        {
+                        // CNAME evaluation, the record is from the CNAME lookup chain.
+                        if client.preserve_intermediates && r.record_type() == RecordType::CNAME {
                             return Some((r, ttl));
                         }
                         // srv evaluation, it's an srv lookup and the srv_search_name/target matches this name
                         //    and it's an IP
                         if query.query_type().is_srv()
-                            && r.rr_type().is_ip_addr()
+                            && r.record_type().is_ip_addr()
                             && search_name.as_ref() == r.name()
                         {
                             found_name = true;
                             Some((r, ttl))
-                        } else if query.query_type().is_ns() && r.rr_type().is_ip_addr() {
+                        } else if query.query_type().is_ns() && r.record_type().is_ip_addr() {
                             Some((r, ttl))
                         } else {
                             None
@@ -431,7 +445,7 @@ where
         // TODO: for SRV records we *could* do an implicit lookup, but, this requires knowing the type of IP desired
         //    for now, we'll make the API require the user to perform a follow up to the lookups.
         // It was a CNAME, but not included in the request...
-        if was_cname && client.query_depth.load(Ordering::Acquire) < MAX_QUERY_DEPTH {
+        if was_cname && !depth.is_exhausted() {
             let next_query = Query::query(search_name, query.query_type());
             Ok(Records::CnameChain {
                 next: Box::pin(Self::inner_lookup(
@@ -439,18 +453,20 @@ where
                     options,
                     client.clone(),
                     preserved_records,
+                    depth.nest(),
                 )),
                 min_ttl: cname_ttl,
             })
         } else {
             // TODO: review See https://tools.ietf.org/html/rfc2308 for NoData section
-            // Note on DNSSec, in secure_client_handle, if verify_nsec fails then the request fails.
+            // Note on DNSSEC, in secure_client_handle, if verify_nsec fails then the request fails.
             //   this will mean that no unverified negative caches will make it to this point and be stored
             Err(Self::handle_nxdomain(
                 is_dnssec,
                 true,
                 query.clone(),
                 soa,
+                None,
                 negative_ttl,
                 response_code,
                 false,
@@ -459,7 +475,7 @@ where
     }
 
     #[allow(clippy::unnecessary_wraps)]
-    fn cname(&self, lookup: Lookup, query: Query, cname_ttl: u32) -> Result<Lookup, ResolveError> {
+    fn cname(&self, lookup: Lookup, query: Query, cname_ttl: u32) -> Result<Lookup, ProtoError> {
         // this duplicates the cache entry under the original query
         Ok(self.lru.duplicate(query, lookup, cname_ttl, Instant::now()))
     }
@@ -467,8 +483,8 @@ where
     fn cache(
         &self,
         query: Query,
-        records: Result<Vec<(Record, u32)>, ResolveError>,
-    ) -> Result<Lookup, ResolveError> {
+        records: Result<Vec<(Record, u32)>, ProtoError>,
+    ) -> Result<Lookup, ProtoError> {
         // this will put this object into an inconsistent state, but no one should call poll again...
         match records {
             Ok(rdata) => Ok(self.lru.insert(query, rdata, Instant::now())),
@@ -477,7 +493,7 @@ where
     }
 
     /// Flushes/Removes all entries from the cache
-    pub fn clear_cache(&mut self) {
+    pub fn clear_cache(&self) {
         self.lru.clear();
     }
 }
@@ -487,7 +503,7 @@ enum Records {
     Exists(Vec<(Record, u32)>),
     /// Future lookup for recursive cname records
     CnameChain {
-        next: Pin<Box<dyn Future<Output = Result<Lookup, ResolveError>> + Send>>,
+        next: Pin<Box<dyn Future<Output = Result<Lookup, ProtoError>> + Send>>,
         min_ttl: u32,
     },
 }
@@ -499,21 +515,23 @@ mod tests {
     use std::str::FromStr;
     use std::time::*;
 
+    use crate::proto::op::{Message, Query};
+    use crate::proto::rr::rdata::{NS, SRV};
+    use crate::proto::rr::{Name, Record};
     use futures_executor::block_on;
-    use proto::op::{Message, Query};
-    use proto::rr::rdata::SRV;
-    use proto::rr::{Name, Record};
+    use test_support::subscribe;
 
     use super::*;
     use crate::lookup_ip::tests::*;
 
     #[test]
     fn test_empty_cache() {
+        subscribe();
         let cache = DnsLru::new(1, dns_lru::TtlConfig::default());
         let client = mock(vec![empty()]);
         let client = CachingClient::with_cache(cache, client, false);
 
-        if let ResolveErrorKind::NoRecordsFound {
+        if let ProtoErrorKind::NoRecordsFound {
             query,
             negative_ttl,
             ..
@@ -522,11 +540,12 @@ mod tests {
             DnsRequestOptions::default(),
             client,
             vec![],
+            DepthTracker::default(),
         ))
         .unwrap_err()
         .kind()
         {
-            assert_eq!(**query, Query::new());
+            assert_eq!(*query, Box::new(Query::new()));
             assert_eq!(*negative_ttl, None);
         } else {
             panic!("wrong error received")
@@ -535,6 +554,7 @@ mod tests {
 
     #[test]
     fn test_from_cache() {
+        subscribe();
         let cache = DnsLru::new(1, dns_lru::TtlConfig::default());
         let query = Query::new();
         cache.insert(
@@ -542,10 +562,10 @@ mod tests {
             vec![(
                 Record::from_rdata(
                     query.name().clone(),
-                    u32::max_value(),
-                    RData::A(Ipv4Addr::new(127, 0, 0, 1)),
+                    u32::MAX,
+                    RData::A(A::new(127, 0, 0, 1)),
                 ),
-                u32::max_value(),
+                u32::MAX,
             )],
             Instant::now(),
         );
@@ -558,33 +578,36 @@ mod tests {
             DnsRequestOptions::default(),
             client,
             vec![],
+            DepthTracker::default(),
         ))
         .unwrap();
 
         assert_eq!(
             ips.iter().cloned().collect::<Vec<_>>(),
-            vec![RData::A(Ipv4Addr::new(127, 0, 0, 1))]
+            vec![RData::A(A::new(127, 0, 0, 1))]
         );
     }
 
     #[test]
     fn test_no_cache_insert() {
+        subscribe();
         let cache = DnsLru::new(1, dns_lru::TtlConfig::default());
         // first should come from client...
         let client = mock(vec![v4_message()]);
         let client = CachingClient::with_cache(cache.clone(), client, false);
 
         let ips = block_on(CachingClient::inner_lookup(
-            Query::new(),
+            Query::query(Name::root(), RecordType::A),
             DnsRequestOptions::default(),
             client,
             vec![],
+            DepthTracker::default(),
         ))
         .unwrap();
 
         assert_eq!(
             ips.iter().cloned().collect::<Vec<_>>(),
-            vec![RData::A(Ipv4Addr::new(127, 0, 0, 1))]
+            vec![RData::A(A::new(127, 0, 0, 1))]
         );
 
         // next should come from cache...
@@ -592,21 +615,22 @@ mod tests {
         let client = CachingClient::with_cache(cache, client, false);
 
         let ips = block_on(CachingClient::inner_lookup(
-            Query::new(),
+            Query::query(Name::root(), RecordType::A),
             DnsRequestOptions::default(),
             client,
             vec![],
+            DepthTracker::default(),
         ))
         .unwrap();
 
         assert_eq!(
             ips.iter().cloned().collect::<Vec<_>>(),
-            vec![RData::A(Ipv4Addr::new(127, 0, 0, 1))]
+            vec![RData::A(A::new(127, 0, 0, 1))]
         );
     }
 
     #[allow(clippy::unnecessary_wraps)]
-    pub(crate) fn cname_message() -> Result<DnsResponse, ResolveError> {
+    pub(crate) fn cname_message() -> Result<DnsResponse, ProtoError> {
         let mut message = Message::new();
         message.add_query(Query::query(
             Name::from_str("www.example.com.").unwrap(),
@@ -615,13 +639,13 @@ mod tests {
         message.insert_answers(vec![Record::from_rdata(
             Name::from_str("www.example.com.").unwrap(),
             86400,
-            RData::CNAME(Name::from_str("actual.example.com.").unwrap()),
+            RData::CNAME(CNAME(Name::from_str("actual.example.com.").unwrap())),
         )]);
-        Ok(message.into())
+        Ok(DnsResponse::from_message(message).unwrap())
     }
 
     #[allow(clippy::unnecessary_wraps)]
-    pub(crate) fn srv_message() -> Result<DnsResponse, ResolveError> {
+    pub(crate) fn srv_message() -> Result<DnsResponse, ProtoError> {
         let mut message = Message::new();
         message.add_query(Query::query(
             Name::from_str("_443._tcp.www.example.com.").unwrap(),
@@ -637,7 +661,7 @@ mod tests {
                 Name::from_str("www.example.com.").unwrap(),
             )),
         )]);
-        Ok(message.into())
+        Ok(DnsResponse::from_message(message).unwrap())
     }
 
     #[allow(clippy::unnecessary_wraps)]
@@ -650,9 +674,9 @@ mod tests {
         message.insert_answers(vec![Record::from_rdata(
             Name::from_str("www.example.com.").unwrap(),
             86400,
-            RData::NS(Name::from_str("www.example.com.").unwrap()),
+            RData::NS(NS(Name::from_str("www.example.com.").unwrap())),
         )]);
-        Ok(message.into())
+        Ok(DnsResponse::from_message(message).unwrap())
     }
 
     fn no_recursion_on_query_test(query_type: RecordType) {
@@ -667,27 +691,34 @@ mod tests {
             DnsRequestOptions::default(),
             client,
             vec![],
+            DepthTracker::default(),
         ))
         .expect("lookup failed");
 
         assert_eq!(
             ips.iter().cloned().collect::<Vec<_>>(),
-            vec![RData::CNAME(Name::from_str("actual.example.com.").unwrap())]
+            vec![RData::CNAME(CNAME(
+                Name::from_str("actual.example.com.").unwrap()
+            ))]
         );
     }
 
     #[test]
     fn test_no_recursion_on_cname_query() {
+        subscribe();
         no_recursion_on_query_test(RecordType::CNAME);
     }
 
     #[test]
     fn test_no_recursion_on_all_query() {
+        subscribe();
         no_recursion_on_query_test(RecordType::ANY);
     }
 
     #[test]
     fn test_non_recursive_srv_query() {
+        subscribe();
+
         let cache = DnsLru::new(1, dns_lru::TtlConfig::default());
 
         // the cname should succeed, we shouldn't query again after that, which would cause an error...
@@ -702,6 +733,7 @@ mod tests {
             DnsRequestOptions::default(),
             client,
             vec![],
+            DepthTracker::default(),
         ))
         .expect("lookup failed");
 
@@ -718,28 +750,33 @@ mod tests {
 
     #[test]
     fn test_single_srv_query_response() {
+        subscribe();
+
         let cache = DnsLru::new(1, dns_lru::TtlConfig::default());
 
-        let mut message = srv_message().unwrap();
+        let mut message = srv_message().unwrap().into_message();
         message.add_answer(Record::from_rdata(
             Name::from_str("www.example.com.").unwrap(),
             86400,
-            RData::CNAME(Name::from_str("actual.example.com.").unwrap()),
+            RData::CNAME(CNAME(Name::from_str("actual.example.com.").unwrap())),
         ));
         message.insert_additionals(vec![
             Record::from_rdata(
                 Name::from_str("actual.example.com.").unwrap(),
                 86400,
-                RData::A(Ipv4Addr::new(127, 0, 0, 1)),
+                RData::A(A::new(127, 0, 0, 1)),
             ),
             Record::from_rdata(
                 Name::from_str("actual.example.com.").unwrap(),
                 86400,
-                RData::AAAA(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
+                RData::AAAA(AAAA::new(0, 0, 0, 0, 0, 0, 0, 1)),
             ),
         ]);
 
-        let client = mock(vec![error(), Ok(message)]);
+        let client = mock(vec![
+            error(),
+            Ok(DnsResponse::from_message(message).unwrap()),
+        ]);
         let client = CachingClient::with_cache(cache, client, false);
 
         let ips = block_on(CachingClient::inner_lookup(
@@ -750,6 +787,7 @@ mod tests {
             DnsRequestOptions::default(),
             client,
             vec![],
+            DepthTracker::default(),
         ))
         .expect("lookup failed");
 
@@ -762,8 +800,8 @@ mod tests {
                     443,
                     Name::from_str("www.example.com.").unwrap(),
                 )),
-                RData::A(Ipv4Addr::new(127, 0, 0, 1)),
-                RData::AAAA(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
+                RData::A(A::new(127, 0, 0, 1)),
+                RData::AAAA(AAAA::new(0, 0, 0, 0, 0, 0, 0, 1)),
             ]
         );
     }
@@ -785,11 +823,11 @@ mod tests {
     //             Name::from_str("actual.example.com.").unwrap(),
     //             86400,
     //             RecordType::A,
-    //             RData::A(Ipv4Addr::new(127, 0, 0, 1)),
+    //             RData::A(Ipv4Addr::LOCALHOST),
     //         ),
     //     ]);
 
-    //     let mut client = mock(vec![error(), Ok(message.into()), srv_message()]);
+    //     let mut client = mock(vec![error(), Ok(DnsResponse::from_message(message).unwrap()), srv_message()]);
 
     //     let ips = QueryState::lookup(
     //         Query::query(
@@ -811,7 +849,7 @@ mod tests {
     //                 443,
     //                 Name::from_str("www.example.com.").unwrap(),
     //             )),
-    //             RData::A(Ipv4Addr::new(127, 0, 0, 1)),
+    //             RData::A(Ipv4Addr::LOCALHOST),
     //             //RData::AAAA(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
     //         ]
     //     );
@@ -819,28 +857,33 @@ mod tests {
 
     #[test]
     fn test_single_ns_query_response() {
+        subscribe();
+
         let cache = DnsLru::new(1, dns_lru::TtlConfig::default());
 
-        let mut message = ns_message().unwrap();
+        let mut message = ns_message().unwrap().into_message();
         message.add_answer(Record::from_rdata(
             Name::from_str("www.example.com.").unwrap(),
             86400,
-            RData::CNAME(Name::from_str("actual.example.com.").unwrap()),
+            RData::CNAME(CNAME(Name::from_str("actual.example.com.").unwrap())),
         ));
         message.insert_additionals(vec![
             Record::from_rdata(
                 Name::from_str("actual.example.com.").unwrap(),
                 86400,
-                RData::A(Ipv4Addr::new(127, 0, 0, 1)),
+                RData::A(A::new(127, 0, 0, 1)),
             ),
             Record::from_rdata(
                 Name::from_str("actual.example.com.").unwrap(),
                 86400,
-                RData::AAAA(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
+                RData::AAAA(AAAA::new(0, 0, 0, 0, 0, 0, 0, 1)),
             ),
         ]);
 
-        let client = mock(vec![error(), Ok(message)]);
+        let client = mock(vec![
+            error(),
+            Ok(DnsResponse::from_message(message).unwrap()),
+        ]);
         let client = CachingClient::with_cache(cache, client, false);
 
         let ips = block_on(CachingClient::inner_lookup(
@@ -848,15 +891,16 @@ mod tests {
             DnsRequestOptions::default(),
             client,
             vec![],
+            DepthTracker::default(),
         ))
         .expect("lookup failed");
 
         assert_eq!(
             ips.iter().cloned().collect::<Vec<_>>(),
             vec![
-                RData::NS(Name::from_str("www.example.com.").unwrap()),
-                RData::A(Ipv4Addr::new(127, 0, 0, 1)),
-                RData::AAAA(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
+                RData::NS(NS(Name::from_str("www.example.com.").unwrap())),
+                RData::A(A::new(127, 0, 0, 1)),
+                RData::AAAA(AAAA::new(0, 0, 0, 0, 0, 0, 0, 1)),
             ]
         );
     }
@@ -870,12 +914,12 @@ mod tests {
         message.insert_answers(vec![Record::from_rdata(
             Name::from_str("ttl.example.com.").unwrap(),
             first,
-            RData::CNAME(Name::from_str("actual.example.com.").unwrap()),
+            RData::CNAME(CNAME(Name::from_str("actual.example.com.").unwrap())),
         )]);
         message.insert_additionals(vec![Record::from_rdata(
             Name::from_str("actual.example.com.").unwrap(),
             second,
-            RData::A(Ipv4Addr::new(127, 0, 0, 1)),
+            RData::A(A::new(127, 0, 0, 1)),
         )]);
 
         let records = CachingClient::handle_noerror(
@@ -883,8 +927,9 @@ mod tests {
             DnsRequestOptions::default(),
             false,
             &Query::query(Name::from_str("ttl.example.com.").unwrap(), RecordType::A),
-            message.into(),
+            DnsResponse::from_message(message).unwrap(),
             vec![],
+            DepthTracker::default(),
         );
 
         if let Ok(records) = records {
@@ -905,12 +950,14 @@ mod tests {
 
     #[test]
     fn test_cname_ttl() {
+        subscribe();
         cname_ttl_test(1, 2);
         cname_ttl_test(2, 1);
     }
 
     #[test]
     fn test_early_return_localhost() {
+        subscribe();
         let cache = DnsLru::new(0, dns_lru::TtlConfig::default());
         let client = mock(vec![empty()]);
         let mut client = CachingClient::with_cache(cache, client, false);
@@ -938,7 +985,7 @@ mod tests {
         }
 
         {
-            let query = Query::query(Name::from(Ipv4Addr::new(127, 0, 0, 1)), RecordType::PTR);
+            let query = Query::query(Name::from(Ipv4Addr::LOCALHOST), RecordType::PTR);
             let lookup = block_on(client.lookup(query.clone(), DnsRequestOptions::default()))
                 .expect("should have returned localhost");
             assert_eq!(lookup.query(), &query);
@@ -962,49 +1009,60 @@ mod tests {
             );
         }
 
-        assert!(block_on(client.lookup(
-            Query::query(Name::from_ascii("localhost.").unwrap(), RecordType::MX),
-            DnsRequestOptions::default()
-        ))
-        .is_err());
+        assert!(
+            block_on(client.lookup(
+                Query::query(Name::from_ascii("localhost.").unwrap(), RecordType::MX),
+                DnsRequestOptions::default()
+            ))
+            .is_err()
+        );
 
-        assert!(block_on(client.lookup(
-            Query::query(Name::from(Ipv4Addr::new(127, 0, 0, 1)), RecordType::MX),
-            DnsRequestOptions::default()
-        ))
-        .is_err());
+        assert!(
+            block_on(client.lookup(
+                Query::query(Name::from(Ipv4Addr::LOCALHOST), RecordType::MX),
+                DnsRequestOptions::default()
+            ))
+            .is_err()
+        );
 
-        assert!(block_on(client.lookup(
-            Query::query(
-                Name::from(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
-                RecordType::MX
-            ),
-            DnsRequestOptions::default()
-        ))
-        .is_err());
+        assert!(
+            block_on(client.lookup(
+                Query::query(
+                    Name::from(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
+                    RecordType::MX
+                ),
+                DnsRequestOptions::default()
+            ))
+            .is_err()
+        );
     }
 
     #[test]
     fn test_early_return_invalid() {
+        subscribe();
         let cache = DnsLru::new(0, dns_lru::TtlConfig::default());
         let client = mock(vec![empty()]);
         let mut client = CachingClient::with_cache(cache, client, false);
 
-        assert!(block_on(client.lookup(
-            Query::query(
-                Name::from_ascii("horrible.invalid.").unwrap(),
-                RecordType::A,
-            ),
-            DnsRequestOptions::default()
-        ))
-        .is_err());
+        assert!(
+            block_on(client.lookup(
+                Query::query(
+                    Name::from_ascii("horrible.invalid.").unwrap(),
+                    RecordType::A,
+                ),
+                DnsRequestOptions::default()
+            ))
+            .is_err()
+        );
     }
 
     #[test]
     fn test_no_error_on_dot_local_no_mdns() {
+        subscribe();
+
         let cache = DnsLru::new(1, dns_lru::TtlConfig::default());
 
-        let mut message = srv_message().unwrap();
+        let mut message = srv_message().unwrap().into_message();
         message.add_query(Query::query(
             Name::from_ascii("www.example.local.").unwrap(),
             RecordType::A,
@@ -1012,19 +1070,24 @@ mod tests {
         message.add_answer(Record::from_rdata(
             Name::from_str("www.example.local.").unwrap(),
             86400,
-            RData::A(Ipv4Addr::new(127, 0, 0, 1)),
+            RData::A(A::new(127, 0, 0, 1)),
         ));
 
-        let client = mock(vec![error(), Ok(message)]);
+        let client = mock(vec![
+            error(),
+            Ok(DnsResponse::from_message(message).unwrap()),
+        ]);
         let mut client = CachingClient::with_cache(cache, client, false);
 
-        assert!(block_on(client.lookup(
-            Query::query(
-                Name::from_ascii("www.example.local.").unwrap(),
-                RecordType::A,
-            ),
-            DnsRequestOptions::default()
-        ))
-        .is_ok());
+        assert!(
+            block_on(client.lookup(
+                Query::query(
+                    Name::from_ascii("www.example.local.").unwrap(),
+                    RecordType::A,
+                ),
+                DnsRequestOptions::default()
+            ))
+            .is_ok()
+        );
     }
 }

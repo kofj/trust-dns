@@ -1,26 +1,36 @@
-// Copyright 2015-2018 Benjamin Fry <benjaminfry@me.com>
+// Copyright 2015-2023 Benjamin Fry <benjaminfry@me.com>
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
 //! `DnsResponse` wraps a `Message` and any associated connection details
 
-use std::future::Future;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::{
+    convert::TryFrom,
+    ops::{Deref, DerefMut},
+};
+use core::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+};
 use std::io;
-use std::ops::{Deref, DerefMut};
-use std::pin::Pin;
-use std::task::{Context, Poll};
 
 use futures_channel::mpsc;
-use futures_util::ready;
-use futures_util::stream::Stream;
+use futures_util::{ready, stream::Stream};
 
-use crate::error::{ProtoError, ProtoErrorKind, ProtoResult};
-use crate::op::{Message, ResponseCode};
-use crate::rr::rdata::SOA;
-use crate::rr::{RData, RecordType};
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    error::{ProtoError, ProtoErrorKind, ProtoResult},
+    op::{Message, ResponseCode},
+    rr::{RecordType, rdata::SOA, resource::RecordRef},
+};
 
 /// A stream returning DNS responses
 pub struct DnsResponseStream {
@@ -37,7 +47,7 @@ impl DnsResponseStream {
 impl Stream for DnsResponseStream {
     type Item = Result<DnsResponse, ProtoError>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         use DnsResponseStreamInner::*;
 
         // if the standard futures are done, don't poll again
@@ -46,10 +56,7 @@ impl Stream for DnsResponseStream {
         }
 
         // split mutable refs to Self
-        let Self {
-            ref mut inner,
-            ref mut done,
-        } = *self.as_mut();
+        let Self { inner, done } = self.get_mut();
 
         let result = match inner {
             Timeout(fut) => {
@@ -60,7 +67,7 @@ impl Stream for DnsResponseStream {
                 *done = true;
                 x
             }
-            Receiver(ref mut fut) => match ready!(Pin::new(fut).poll_next(cx)) {
+            Receiver(fut) => match ready!(Pin::new(fut).poll_next(cx)) {
                 Some(x) => x,
                 None => return Poll::Ready(None),
             },
@@ -123,22 +130,40 @@ type TimeoutFuture = Pin<
 >;
 
 // TODO: this needs to have the IP addr of the remote system...
-// TODO: see https://github.com/bluejekyll/trust-dns/issues/383 for removing vec of messages and instead returning a Stream
+// TODO: see https://github.com/hickory-dns/hickory-dns/issues/383 for removing vec of messages and instead returning a Stream
 /// A DNS response object
 ///
 /// For Most DNS requests, only one response is expected, the exception is a multicast request.
 #[derive(Clone, Debug)]
-pub struct DnsResponse(Message);
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
+pub struct DnsResponse {
+    message: Message,
+    buffer: Vec<u8>,
+}
 
 // TODO: when `impl Trait` lands in stable, remove this, and expose FlatMap over answers, et al.
 impl DnsResponse {
+    /// Constructs a new DnsResponse with a buffer synthesized from the message
+    pub fn from_message(message: Message) -> Result<Self, ProtoError> {
+        Ok(Self {
+            buffer: message.to_vec()?,
+            message,
+        })
+    }
+
+    /// Constructs a new DnsResponse by parsing a message from a buffer.
+    ///
+    /// Returns an error if the response message cannot be decoded.
+    pub fn from_buffer(buffer: Vec<u8>) -> Result<Self, ProtoError> {
+        let message = Message::from_vec(&buffer)?;
+        Ok(Self { message, buffer })
+    }
+
     /// Retrieves the SOA from the response. This will only exist if it was an authoritative response.
-    pub fn soa(&self) -> Option<SOA> {
+    pub fn soa(&self) -> Option<RecordRef<'_, SOA>> {
         self.name_servers()
             .iter()
-            .filter_map(|record| record.data().and_then(RData::as_soa))
-            .next()
-            .cloned()
+            .find_map(|record| RecordRef::try_from(record).ok())
     }
 
     /// Looks in the authority section for an SOA record from the response, and returns the negative_ttl, None if not available.
@@ -200,14 +225,9 @@ impl DnsResponse {
         // TODO: should this ensure that the SOA zone matches the Queried Zone?
         self.name_servers()
             .iter()
-            .filter_map(|record| {
-                record
-                    .data()
-                    .and_then(RData::as_soa)
-                    .map(|soa| (record.ttl(), soa))
-            })
+            .filter_map(|record| record.data().as_soa().map(|soa| (record.ttl(), soa)))
             .next()
-            .map(|(ttl, soa)| (ttl as u32).min(soa.minimum()).max(0))
+            .map(|(ttl, soa)| (ttl).min(soa.minimum()))
     }
 
     /// Does the response contain any records matching the query name and type?
@@ -247,7 +267,7 @@ impl DnsResponse {
     pub fn negative_type(&self) -> Option<NegativeType> {
         let response_code = self.response_code();
         let ttl_from_soa = self.negative_ttl();
-        let has_soa = ttl_from_soa.map_or(false, |_| true);
+        let has_soa = ttl_from_soa.is_some();
         let has_ns_records = self.name_servers().iter().any(|r| r.record_type().is_ns());
         let has_cname = self.answers().iter().any(|r| r.record_type().is_cname());
         let has_non_cname = self.answers().iter().any(|r| !r.record_type().is_cname());
@@ -282,31 +302,45 @@ impl DnsResponse {
             _ => None,
         }
     }
+
+    /// Borrow the inner buffer from the response
+    pub fn as_buffer(&self) -> &[u8] {
+        &self.buffer
+    }
+
+    /// Take the inner buffer from the response
+    pub fn into_buffer(self) -> Vec<u8> {
+        self.buffer
+    }
+
+    /// Take the inner Message from the response
+    pub fn into_message(self) -> Message {
+        self.message
+    }
+
+    /// Take the inner Message and buffer from the response
+    pub fn into_parts(self) -> (Message, Vec<u8>) {
+        (self.message, self.buffer)
+    }
 }
 
 impl Deref for DnsResponse {
     type Target = Message;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.message
     }
 }
 
 impl DerefMut for DnsResponse {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.message
     }
 }
 
 impl From<DnsResponse> for Message {
     fn from(response: DnsResponse) -> Self {
-        response.0
-    }
-}
-
-impl From<Message> for DnsResponse {
-    fn from(message: Message) -> Self {
-        Self(message)
+        response.message
     }
 }
 
@@ -332,7 +366,7 @@ impl From<Message> for DnsResponse {
 ///    and the authority section may have SOA, NXT [RFC2065] and SIG RRsets.
 ///
 ///    It is possible to distinguish between a referral and a NXDOMAIN
-///    response by the presense of NXDOMAIN in the RCODE regardless of the
+///    response by the presence of NXDOMAIN in the RCODE regardless of the
 ///    presence of NS or SOA records in the authority section.
 ///
 ///    NXDOMAIN responses can be categorised into four types by the contents
@@ -614,10 +648,7 @@ impl NegativeType {
     pub fn is_authoritative(&self) -> bool {
         matches!(
             self,
-            NegativeType::NameErrorType1
-                | NegativeType::NameErrorType2
-                | NegativeType::NoDataType1
-                | NegativeType::NoDataType2
+            Self::NameErrorType1 | Self::NameErrorType2 | Self::NoDataType1 | Self::NoDataType2
         )
     }
 }
@@ -625,8 +656,8 @@ impl NegativeType {
 #[cfg(test)]
 mod tests {
     use crate::op::{Message, Query, ResponseCode};
-    use crate::rr::rdata::SOA;
     use crate::rr::RData;
+    use crate::rr::rdata::{A, CNAME, NS, SOA};
     use crate::rr::{Name, Record, RecordType};
 
     use super::*;
@@ -664,23 +695,23 @@ mod tests {
     }
 
     fn an_cname_record() -> Record {
-        Record::from_rdata(an_example(), 88640, RData::CNAME(tripple_xx()))
+        Record::from_rdata(an_example(), 88640, RData::CNAME(CNAME(tripple_xx())))
     }
 
     fn ns1_record() -> Record {
-        Record::from_rdata(xx(), 88640, RData::NS(ns1()))
+        Record::from_rdata(xx(), 88640, RData::NS(NS(ns1())))
     }
 
     fn ns2_record() -> Record {
-        Record::from_rdata(xx(), 88640, RData::NS(ns2()))
+        Record::from_rdata(xx(), 88640, RData::NS(NS(ns2())))
     }
 
     fn ns1_a() -> Record {
-        Record::from_rdata(xx(), 88640, RData::A([127, 0, 0, 2].into()))
+        Record::from_rdata(xx(), 88640, RData::A(A::new(127, 0, 0, 2)))
     }
 
     fn ns2_a() -> Record {
-        Record::from_rdata(xx(), 88640, RData::A([127, 0, 0, 3].into()))
+        Record::from_rdata(xx(), 88640, RData::A(A::new(127, 0, 0, 3)))
     }
 
     fn soa() -> Record {
@@ -707,10 +738,10 @@ mod tests {
         message.add_answer(Record::from_rdata(
             Name::root(),
             88640,
-            RData::A([127, 0, 0, 2].into()),
+            RData::A(A::new(127, 0, 0, 2)),
         ));
 
-        let response = DnsResponse::from(message);
+        let response = DnsResponse::from_message(message).unwrap();
 
         assert!(response.contains_answer())
     }
@@ -727,7 +758,7 @@ mod tests {
         message.add_additional(ns1_a());
         message.add_additional(ns2_a());
 
-        let response = DnsResponse::from(message);
+        let response = DnsResponse::from_message(message).unwrap();
         let ty = response.negative_type();
 
         assert!(response.contains_answer());
@@ -742,7 +773,7 @@ mod tests {
         message.add_answer(an_cname_record());
         message.add_name_server(soa());
 
-        let response = DnsResponse::from(message);
+        let response = DnsResponse::from_message(message).unwrap();
         let ty = response.negative_type();
 
         assert!(response.contains_answer());
@@ -756,7 +787,7 @@ mod tests {
         message.add_query(an_query());
         message.add_answer(an_cname_record());
 
-        let response = DnsResponse::from(message);
+        let response = DnsResponse::from_message(message).unwrap();
         let ty = response.negative_type();
 
         assert!(response.contains_answer());
@@ -774,7 +805,7 @@ mod tests {
         message.add_additional(ns1_a());
         message.add_additional(ns2_a());
 
-        let response = DnsResponse::from(message);
+        let response = DnsResponse::from_message(message).unwrap();
         let ty = response.negative_type();
 
         assert!(response.contains_answer());
@@ -791,7 +822,7 @@ mod tests {
         message.add_name_server(ns2_record());
         message.add_additional(ns1_a());
         message.add_additional(ns2_a());
-        let response = DnsResponse::from(message);
+        let response = DnsResponse::from_message(message).unwrap();
         let ty = response.negative_type();
 
         assert!(!response.contains_answer());
@@ -805,7 +836,7 @@ mod tests {
         message.add_query(another_query());
         message.add_name_server(soa());
 
-        let response = DnsResponse::from(message);
+        let response = DnsResponse::from_message(message).unwrap();
         let ty = response.negative_type();
 
         assert!(!response.contains_answer());
@@ -818,7 +849,7 @@ mod tests {
         message.set_response_code(ResponseCode::NoError);
         message.add_query(another_query());
 
-        let response = DnsResponse::from(message);
+        let response = DnsResponse::from_message(message).unwrap();
         let ty = response.negative_type();
 
         assert!(!response.contains_answer());
@@ -836,7 +867,7 @@ mod tests {
         message.add_additional(ns1_a());
         message.add_additional(ns2_a());
 
-        let response = DnsResponse::from(message);
+        let response = DnsResponse::from_message(message).unwrap();
         let ty = response.negative_type();
 
         assert!(response.contains_answer());
@@ -850,7 +881,7 @@ mod tests {
         message.add_additional(ns1_a());
         message.add_additional(ns2_a());
 
-        let response = DnsResponse::from(message);
+        let response = DnsResponse::from_message(message).unwrap();
         let ty = response.negative_type();
 
         assert!(!response.contains_answer());
@@ -864,7 +895,7 @@ mod tests {
         message.add_query(Query::query(an_example(), RecordType::SOA));
         message.add_name_server(soa());
 
-        let response = DnsResponse::from(message);
+        let response = DnsResponse::from_message(message).unwrap();
 
         assert!(response.contains_answer());
     }
@@ -877,7 +908,7 @@ mod tests {
         message.add_name_server(ns1_record());
         message.add_additional(ns1_a());
 
-        let response = DnsResponse::from(message);
+        let response = DnsResponse::from_message(message).unwrap();
 
         assert!(response.contains_answer());
     }

@@ -1,8 +1,8 @@
 // Copyright 2015-2016 Benjamin Fry <benjaminfry -@- me.com>
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
 //! All zone persistence related types
@@ -11,12 +11,12 @@ use std::iter::Iterator;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
-use log::error;
 use rusqlite::types::ToSql;
 use rusqlite::{self, Connection};
 use time;
+use tracing::error;
 
-use crate::error::{PersistenceErrorKind, PersistenceResult};
+use crate::error::{PersistenceError, PersistenceErrorKind};
 use crate::proto::rr::Record;
 use crate::proto::serialize::binary::{BinDecodable, BinDecoder, BinEncodable, BinEncoder};
 
@@ -31,7 +31,7 @@ pub struct Journal {
 
 impl Journal {
     /// Constructs a new Journal, attaching to the specified Sqlite Connection
-    pub fn new(conn: Connection) -> PersistenceResult<Self> {
+    pub fn new(conn: Connection) -> Result<Self, PersistenceError> {
         let version = Self::select_schema_version(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -40,15 +40,11 @@ impl Journal {
     }
 
     /// Constructs a new Journal opening a Sqlite connection to the file at the specified path
-    pub fn from_file(journal_file: &Path) -> PersistenceResult<Self> {
+    pub fn from_file(journal_file: &Path) -> Result<Self, PersistenceError> {
         let result = Self::new(Connection::open(journal_file)?);
-        match result {
-            Ok(mut journal) => {
-                journal.schema_up().unwrap();
-                Ok(journal)
-            }
-            Err(err) => Err(err),
-        }
+        let mut journal = result?;
+        journal.schema_up()?;
+        Ok(journal)
     }
 
     /// Returns a reference to the Sqlite Connection
@@ -75,7 +71,7 @@ impl Journal {
     /// # Argument
     ///
     /// * `record` - will be serialized into the journal
-    pub fn insert_record(&self, soa_serial: u32, record: &Record) -> PersistenceResult<()> {
+    pub fn insert_record(&self, soa_serial: u32, record: &Record) -> Result<(), PersistenceError> {
         assert!(
             self.version == CURRENT_VERSION,
             "schema version mismatch, schema_up() resolves this"
@@ -98,7 +94,7 @@ impl Journal {
                                             record)
                                           \
                                             VALUES ($1, $2, $3, $4)",
-            &[
+            [
                 &client_id as &dyn ToSql,
                 &soa_serial,
                 &timestamp,
@@ -118,7 +114,11 @@ impl Journal {
     }
 
     /// Inserts a set of records into the Journal, a convenience method for insert_record
-    pub fn insert_records(&self, soa_serial: u32, records: &[Record]) -> PersistenceResult<()> {
+    pub fn insert_records(
+        &self,
+        soa_serial: u32,
+        records: &[Record],
+    ) -> Result<(), PersistenceError> {
         // TODO: NEED TRANSACTION HERE
         for record in records {
             self.insert_record(soa_serial, record)?;
@@ -136,7 +136,7 @@ impl Journal {
     ///
     /// * `row_id` - the row_id can either be exact, or start at 0 to get the earliest row in the
     ///              list.
-    pub fn select_record(&self, row_id: i64) -> PersistenceResult<Option<(i64, Record)>> {
+    pub fn select_record(&self, row_id: i64) -> Result<Option<(i64, Record)>, PersistenceError> {
         assert!(
             self.version == CURRENT_VERSION,
             "schema version mismatch, schema_up() resolves this"
@@ -154,23 +154,19 @@ impl Journal {
         )?;
 
         let record_opt: Option<Result<(i64, Record), rusqlite::Error>> = stmt
-            .query_and_then(
-                &[&row_id],
-                |row| -> Result<(i64, Record), rusqlite::Error> {
-                    let row_id: i64 = row.get(0)?;
-                    let record_bytes: Vec<u8> = row.get(1)?;
-                    let mut decoder = BinDecoder::new(&record_bytes);
+            .query_and_then([&row_id], |row| -> Result<(i64, Record), rusqlite::Error> {
+                let row_id: i64 = row.get(0)?;
+                let record_bytes: Vec<u8> = row.get(1)?;
+                let mut decoder = BinDecoder::new(&record_bytes);
 
-                    // todo add location to this...
-                    match Record::read(&mut decoder) {
-                        Ok(record) => Ok((row_id, record)),
-                        Err(decode_error) => Err(rusqlite::Error::InvalidParameterName(format!(
-                            "could not decode: {}",
-                            decode_error
-                        ))),
-                    }
-                },
-            )?
+                // todo add location to this...
+                match Record::read(&mut decoder) {
+                    Ok(record) => Ok((row_id, record)),
+                    Err(decode_error) => Err(rusqlite::Error::InvalidParameterName(format!(
+                        "could not decode: {decode_error}"
+                    ))),
+                }
+            })?
             .next();
 
         //
@@ -187,7 +183,7 @@ impl Journal {
     /// # Arguments
     ///
     /// * `conn` - db connection to use
-    pub fn select_schema_version(conn: &Connection) -> PersistenceResult<i64> {
+    pub fn select_schema_version(conn: &Connection) -> Result<i64, PersistenceError> {
         // first see if our schema is there
         let mut stmt = conn.prepare(
             "SELECT name
@@ -222,7 +218,7 @@ impl Journal {
     }
 
     /// update the schema version
-    fn update_schema_version(&self, new_version: i64) -> PersistenceResult<()> {
+    fn update_schema_version(&self, new_version: i64) -> Result<(), PersistenceError> {
         // validate the versions of all the schemas...
         assert!(new_version <= CURRENT_VERSION);
 
@@ -230,7 +226,7 @@ impl Journal {
             .conn
             .lock()
             .expect("conn poisoned")
-            .execute("UPDATE tdns_schema SET version = $1", &[&new_version])?;
+            .execute("UPDATE tdns_schema SET version = $1", [&new_version])?;
 
         //
         assert_eq!(count, 1);
@@ -238,7 +234,7 @@ impl Journal {
     }
 
     /// initializes the schema for the Journal
-    pub fn schema_up(&mut self) -> PersistenceResult<i64> {
+    pub fn schema_up(&mut self) -> Result<i64, PersistenceError> {
         while self.version < CURRENT_VERSION {
             match self.version + 1 {
                 0 => self.version = self.init_up()?,
@@ -253,7 +249,7 @@ impl Journal {
     }
 
     /// initial schema, include the tdns_schema table for tracking the Journal version
-    fn init_up(&self) -> PersistenceResult<i64> {
+    fn init_up(&self) -> Result<i64, PersistenceError> {
         let count = self.conn.lock().expect("conn poisoned").execute(
             "CREATE TABLE tdns_schema (
                                           \
@@ -278,7 +274,7 @@ impl Journal {
 
     /// adds the records table, this is the main and single table for the history of changes to an
     ///  authority. Each record is expected to be in the format of an update record
-    fn records_up(&self) -> PersistenceResult<i64> {
+    fn records_up(&self) -> Result<i64, PersistenceError> {
         // we'll be using rowid for our primary key, basically: `rowid INTEGER PRIMARY KEY ASC`
         let count = self.conn.lock().expect("conn poisoned").execute(
             "CREATE TABLE records (
@@ -318,14 +314,11 @@ impl<'j> JournalIter<'j> {
     }
 }
 
-impl<'j> Iterator for JournalIter<'j> {
+impl Iterator for JournalIter<'_> {
     type Item = Record;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let next: PersistenceResult<Option<(i64, Record)>> =
-            self.journal.select_record(self.current_row_id + 1);
-
-        match next {
+        match self.journal.select_record(self.current_row_id + 1) {
             Ok(Some((row_id, record))) => {
                 self.current_row_id = row_id;
                 Some(record)

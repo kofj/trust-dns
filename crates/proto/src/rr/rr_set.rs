@@ -1,23 +1,19 @@
-// Copyright 2015-2019 Benjamin Fry <benjaminfry@me.com>
+// Copyright 2015-2023 Benjamin Fry <benjaminfry@me.com>
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
-use std::iter::Chain;
-use std::slice::Iter;
-use std::vec;
 
-use log::{info, warn};
+use alloc::vec;
+use alloc::vec::Vec;
+use core::{iter::Chain, slice::Iter};
+use tracing::{info, warn};
 
 use crate::rr::{DNSClass, Name, RData, Record, RecordType};
 
-#[cfg(feature = "dnssec")]
-#[cfg_attr(docsrs, doc(cfg(feature = "dnssec")))]
-use crate::rr::dnssec::SupportedAlgorithms;
-
 /// Set of resource records associated to a name and type
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordSet {
     name: Name,
     record_type: RecordType,
@@ -37,15 +33,15 @@ impl RecordSet {
     /// * `record_type` - `RecordType` of this `RecordSet`, all records in the `RecordSet` must be of the
     ///                   specified `RecordType`.
     /// * `serial` - current serial number of the `SOA` record, this is to be used for `IXFR` and
-    ///              signing for DNSSec after updates.
+    ///              signing for DNSSEC after updates.
     ///
     /// # Return value
     ///
     /// The newly created Resource Record Set
     /// TODO: make all cloned params pass by value
-    pub fn new(name: &Name, record_type: RecordType, serial: u32) -> Self {
+    pub fn new(name: Name, record_type: RecordType, serial: u32) -> Self {
         Self {
-            name: name.clone(),
+            name,
             record_type,
             dns_class: DNSClass::IN,
             ttl: 0,
@@ -134,42 +130,24 @@ impl RecordSet {
     /// # Arguments
     ///
     /// * `and_rrsigs` - if true, RRSIGs will be returned if they exist
-    /// * `supported_algorithms` - the RRSIGs will be filtered by the set of supported_algorithms,
-    ///                            and then only the maximal RRSIG algorithm will be returned.
-    #[cfg(feature = "dnssec")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "dnssec")))]
-    pub fn records(
-        &self,
-        and_rrsigs: bool,
-        supported_algorithms: SupportedAlgorithms,
-    ) -> RrsetRecords<'_> {
+    #[cfg(feature = "__dnssec")]
+    pub fn records(&self, and_rrsigs: bool) -> RrsetRecords<'_> {
         if and_rrsigs {
-            self.records_with_rrsigs(supported_algorithms)
+            self.records_with_rrsigs()
         } else {
             self.records_without_rrsigs()
         }
     }
 
     /// Returns a Vec of all records in the set, with RRSIGs, if present.
-    ///
-    /// # Arguments
-    ///
-    /// * `supported_algorithms` - the RRSIGs will be filtered by the set of supported_algorithms,
-    ///                            and then only the maximal RRSIG algorithm will be returned.
-    #[cfg(feature = "dnssec")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "dnssec")))]
-    pub fn records_with_rrsigs(
-        &self,
-        supported_algorithms: SupportedAlgorithms,
-    ) -> RrsetRecords<'_> {
+    #[cfg(feature = "__dnssec")]
+    pub fn records_with_rrsigs(&self) -> RrsetRecords<'_> {
         if self.records.is_empty() {
             RrsetRecords::Empty
         } else {
-            let rrsigs = RrsigsByAlgorithms {
-                rrsigs: self.rrsigs.iter(),
-                supported_algorithms,
-            };
-            RrsetRecords::RecordsAndRrsigs(RecordsAndRrsigsIter(self.records.iter().chain(rrsigs)))
+            RrsetRecords::RecordsAndRrsigs(RecordsAndRrsigsIter(
+                self.records.iter().chain(self.rrsigs.iter()),
+            ))
         }
     }
 
@@ -232,16 +210,15 @@ impl RecordSet {
 
         self.records
             .iter()
-            .find(|r| r.data().map(|r| r == rdata).unwrap_or(false))
+            .find(|r| r.data() == rdata)
             .expect("insert failed")
     }
 
     /// creates a new Record as part of this RecordSet, adding the associated RData
     pub fn add_rdata(&mut self, rdata: RData) -> bool {
-        debug_assert_eq!(self.record_type, rdata.to_record_type());
+        debug_assert_eq!(self.record_type, rdata.record_type());
 
-        let mut record = Record::with(self.name.clone(), self.record_type, self.ttl);
-        record.set_data(Some(rdata));
+        let record = Record::from_rdata(self.name.clone(), self.ttl, rdata);
         self.insert(record, 0)
     }
 
@@ -270,7 +247,7 @@ impl RecordSet {
     ///
     /// * `record` - `Record` asserts that the `name` and `record_type` match the `RecordSet`.
     /// * `serial` - current serial number of the `SOA` record, this is to be used for `IXFR` and
-    ///              signing for DNSSec after updates. The serial will only be updated if the
+    ///              signing for DNSSEC after updates. The serial will only be updated if the
     ///              record was added.
     ///
     /// # Return value
@@ -280,24 +257,24 @@ impl RecordSet {
     /// TODO: make a default add without serial number for basic usage
     pub fn insert(&mut self, record: Record, serial: u32) -> bool {
         assert_eq!(record.name(), &self.name);
-        assert_eq!(record.rr_type(), self.record_type);
+        assert_eq!(record.record_type(), self.record_type);
 
         // RFC 2136                       DNS Update                     April 1997
         //
         // 1.1.5. The following RR types cannot be appended to an RRset.  If the
         //  following comparison rules are met, then an attempt to add the new RR
         //  will result in the replacement of the previous RR:
-        match record.rr_type() {
+        match record.record_type() {
             // SOA    compare only NAME, CLASS and TYPE -- it is not possible to
             //         have more than one SOA per zone, even if any of the data
             //         fields differ.
             RecordType::SOA => {
                 assert!(self.records.len() <= 1);
 
-                if let Some(soa_record) = self.records.get(0) {
+                if let Some(soa_record) = self.records.first() {
                     match soa_record.data() {
-                        Some(RData::SOA(ref existing_soa)) => {
-                            if let Some(RData::SOA(ref new_soa)) = record.data() {
+                        RData::SOA(existing_soa) => {
+                            if let RData::SOA(new_soa) = record.data() {
                                 if new_soa.serial() <= existing_soa.serial() {
                                     info!(
                                         "update ignored serial out of data: {:?} <= {:?}",
@@ -393,7 +370,7 @@ impl RecordSet {
     /// * `record` - `Record` asserts that the `name` and `record_type` match the `RecordSet`. Removes
     ///              any `record` if the record data, `RData`, match.
     /// * `serial` - current serial number of the `SOA` record, this is to be used for `IXFR` and
-    ///              signing for DNSSec after updates. The serial will only be updated if the
+    ///              signing for DNSSEC after updates. The serial will only be updated if the
     ///              record was added.
     ///
     /// # Return value
@@ -401,9 +378,11 @@ impl RecordSet {
     /// True if a record was removed.
     pub fn remove(&mut self, record: &Record, serial: u32) -> bool {
         assert_eq!(record.name(), &self.name);
-        assert!(record.rr_type() == self.record_type || record.rr_type() == RecordType::ANY);
+        assert!(
+            record.record_type() == self.record_type || record.record_type() == RecordType::ANY
+        );
 
-        match record.rr_type() {
+        match record.record_type() {
             // never delete the last NS record
             RecordType::NS => {
                 if self.records.len() <= 1 {
@@ -446,7 +425,7 @@ impl RecordSet {
 
 /// Consumes `RecordSet` giving public access to fields of `RecordSet` so they can
 /// be destructured and taken by value
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordSetParts {
     pub name: Name,
     pub record_type: RecordType,
@@ -454,7 +433,7 @@ pub struct RecordSetParts {
     pub ttl: u32,
     pub records: Vec<Record>,
     pub rrsigs: Vec<Record>,
-    pub serial: u32, // serial number at which this record was modifie,
+    pub serial: u32, // serial number at which this record was modified,
 }
 
 impl From<RecordSet> for RecordSetParts {
@@ -484,7 +463,7 @@ impl From<Record> for RecordSet {
     fn from(record: Record) -> Self {
         Self {
             name: record.name().clone(),
-            record_type: record.rr_type(),
+            record_type: record.record_type(),
             dns_class: record.dns_class(),
             ttl: record.ttl(),
             records: vec![record],
@@ -513,68 +492,21 @@ impl IntoIterator for RecordSet {
     type IntoIter = Chain<vec::IntoIter<Record>, vec::IntoIter<Record>>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.records.into_iter().chain(self.rrsigs.into_iter())
+        self.records.into_iter().chain(self.rrsigs)
     }
 }
 
 /// An iterator over all the records and their signatures
-#[cfg(feature = "dnssec")]
-#[cfg_attr(docsrs, doc(cfg(feature = "dnssec")))]
+#[cfg(feature = "__dnssec")]
 #[derive(Debug)]
-pub struct RecordsAndRrsigsIter<'r>(Chain<Iter<'r, Record>, RrsigsByAlgorithms<'r>>);
+pub struct RecordsAndRrsigsIter<'r>(Chain<Iter<'r, Record>, Iter<'r, Record>>);
 
-#[cfg(feature = "dnssec")]
-#[cfg_attr(docsrs, doc(cfg(feature = "dnssec")))]
+#[cfg(feature = "__dnssec")]
 impl<'r> Iterator for RecordsAndRrsigsIter<'r> {
     type Item = &'r Record;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.0.next()
-    }
-}
-
-/// An iterator that limits the record signatures by SupportedAlgorithms
-#[cfg(feature = "dnssec")]
-#[cfg_attr(docsrs, doc(cfg(feature = "dnssec")))]
-#[derive(Debug)]
-pub(crate) struct RrsigsByAlgorithms<'r> {
-    rrsigs: Iter<'r, Record>,
-    supported_algorithms: SupportedAlgorithms,
-}
-
-#[cfg(feature = "dnssec")]
-#[cfg_attr(docsrs, doc(cfg(feature = "dnssec")))]
-impl<'r> Iterator for RrsigsByAlgorithms<'r> {
-    type Item = &'r Record;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        use crate::rr::dnssec::rdata::DNSSECRData;
-        use crate::rr::dnssec::Algorithm;
-
-        let supported_algorithms = self.supported_algorithms;
-
-        // disable rfc 6975 when no supported_algorithms specified
-        if supported_algorithms.is_empty() {
-            self.rrsigs.next()
-        } else {
-            self.rrsigs
-                .by_ref()
-                .filter(|record| {
-                    if let Some(RData::DNSSEC(DNSSECRData::SIG(ref rrsig))) = record.data() {
-                        supported_algorithms.has(rrsig.algorithm())
-                    } else {
-                        false
-                    }
-                })
-                .max_by_key(|record| {
-                    if let Some(RData::DNSSEC(DNSSECRData::SIG(ref rrsig))) = record.data() {
-                        rrsig.algorithm()
-                    } else {
-                        #[allow(deprecated)]
-                        Algorithm::RSASHA1
-                    }
-                })
-        }
     }
 }
 
@@ -586,13 +518,12 @@ pub enum RrsetRecords<'r> {
     /// The records associated with the record set
     RecordsOnly(Iter<'r, Record>),
     /// The records along with their signatures in the record set
-    #[cfg(feature = "dnssec")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "dnssec")))]
+    #[cfg(feature = "__dnssec")]
     RecordsAndRrsigs(RecordsAndRrsigsIter<'r>),
 }
 
-impl<'r> RrsetRecords<'r> {
-    /// This is a best effort emptyness check
+impl RrsetRecords<'_> {
+    /// This is a best effort emptiness check
     pub fn is_empty(&self) -> bool {
         matches!(*self, RrsetRecords::Empty)
     }
@@ -605,7 +536,7 @@ impl<'r> Iterator for RrsetRecords<'r> {
         match self {
             RrsetRecords::Empty => None,
             RrsetRecords::RecordsOnly(i) => i.next(),
-            #[cfg(feature = "dnssec")]
+            #[cfg(feature = "__dnssec")]
             RrsetRecords::RecordsAndRrsigs(i) => i.next(),
         }
     }
@@ -613,47 +544,47 @@ impl<'r> Iterator for RrsetRecords<'r> {
 
 #[cfg(test)]
 mod test {
+    use core::str::FromStr;
     use std::net::Ipv4Addr;
-    use std::str::FromStr;
 
-    use crate::rr::rdata::SOA;
+    use crate::rr::rdata::{CNAME, NS, SOA};
     use crate::rr::*;
 
     #[test]
     fn test_insert() {
         let name = Name::from_str("www.example.com.").unwrap();
         let record_type = RecordType::A;
-        let mut rr_set = RecordSet::new(&name, record_type, 0);
+        let mut rr_set = RecordSet::new(name.clone(), record_type, 0);
 
-        let insert = Record::new()
-            .set_name(name.clone())
-            .set_ttl(86400)
-            .set_rr_type(record_type)
-            .set_dns_class(DNSClass::IN)
-            .set_data(Some(RData::A(Ipv4Addr::new(93, 184, 216, 24))))
-            .clone();
+        let insert = Record::from_rdata(
+            name.clone(),
+            86400,
+            RData::A(Ipv4Addr::new(93, 184, 216, 24).into()),
+        )
+        .set_dns_class(DNSClass::IN)
+        .clone();
 
         assert!(rr_set.insert(insert.clone(), 0));
         assert_eq!(rr_set.records_without_rrsigs().count(), 1);
-        assert!(rr_set.records_without_rrsigs().any(|ref x| x == &&insert));
+        assert!(rr_set.records_without_rrsigs().any(|x| x == &insert));
 
         // dups ignored
         assert!(!rr_set.insert(insert.clone(), 0));
         assert_eq!(rr_set.records_without_rrsigs().count(), 1);
-        assert!(rr_set.records_without_rrsigs().any(|ref x| x == &&insert));
+        assert!(rr_set.records_without_rrsigs().any(|x| x == &insert));
 
         // add one
-        let insert1 = Record::new()
-            .set_name(name)
-            .set_ttl(86400)
-            .set_rr_type(record_type)
-            .set_dns_class(DNSClass::IN)
-            .set_data(Some(RData::A(Ipv4Addr::new(93, 184, 216, 25))))
-            .clone();
+        let insert1 = Record::from_rdata(
+            name,
+            86400,
+            RData::A(Ipv4Addr::new(93, 184, 216, 25).into()),
+        )
+        .set_dns_class(DNSClass::IN)
+        .clone();
         assert!(rr_set.insert(insert1.clone(), 0));
         assert_eq!(rr_set.records_without_rrsigs().count(), 2);
-        assert!(rr_set.records_without_rrsigs().any(|ref x| x == &&insert));
-        assert!(rr_set.records_without_rrsigs().any(|ref x| x == &&insert1));
+        assert!(rr_set.records_without_rrsigs().any(|x| x == &insert));
+        assert!(rr_set.records_without_rrsigs().any(|x| x == &insert1));
     }
 
     #[test]
@@ -661,14 +592,12 @@ mod test {
     fn test_insert_soa() {
         let name = Name::from_str("example.com.").unwrap();
         let record_type = RecordType::SOA;
-        let mut rr_set = RecordSet::new(&name, record_type, 0);
+        let mut rr_set = RecordSet::new(name.clone(), record_type, 0);
 
-        let insert = Record::new()
-            .set_name(name.clone())
-            .set_ttl(3600)
-            .set_rr_type(RecordType::SOA)
-            .set_dns_class(DNSClass::IN)
-            .set_data(Some(RData::SOA(SOA::new(
+        let insert = Record::from_rdata(
+            name.clone(),
+            3600,
+            RData::SOA(SOA::new(
                 Name::from_str("sns.dns.icann.org.").unwrap(),
                 Name::from_str("noc.dns.icann.org.").unwrap(),
                 2015082403,
@@ -676,14 +605,14 @@ mod test {
                 3600,
                 1209600,
                 3600,
-            ))))
-            .clone();
-        let same_serial = Record::new()
-            .set_name(name.clone())
-            .set_ttl(3600)
-            .set_rr_type(RecordType::SOA)
-            .set_dns_class(DNSClass::IN)
-            .set_data(Some(RData::SOA(SOA::new(
+            )),
+        )
+        .set_dns_class(DNSClass::IN)
+        .clone();
+        let same_serial = Record::from_rdata(
+            name.clone(),
+            3600,
+            RData::SOA(SOA::new(
                 Name::from_str("sns.dns.icann.net.").unwrap(),
                 Name::from_str("noc.dns.icann.net.").unwrap(),
                 2015082403,
@@ -691,14 +620,14 @@ mod test {
                 3600,
                 1209600,
                 3600,
-            ))))
-            .clone();
-        let new_serial = Record::new()
-            .set_name(name)
-            .set_ttl(3600)
-            .set_rr_type(RecordType::SOA)
-            .set_dns_class(DNSClass::IN)
-            .set_data(Some(RData::SOA(SOA::new(
+            )),
+        )
+        .set_dns_class(DNSClass::IN)
+        .clone();
+        let new_serial = Record::from_rdata(
+            name,
+            3600,
+            RData::SOA(SOA::new(
                 Name::from_str("sns.dns.icann.net.").unwrap(),
                 Name::from_str("noc.dns.icann.net.").unwrap(),
                 2015082404,
@@ -706,29 +635,25 @@ mod test {
                 3600,
                 1209600,
                 3600,
-            ))))
-            .clone();
+            )),
+        )
+        .set_dns_class(DNSClass::IN)
+        .clone();
 
         assert!(rr_set.insert(insert.clone(), 0));
-        assert!(rr_set.records_without_rrsigs().any(|ref x| x == &&insert));
+        assert!(rr_set.records_without_rrsigs().any(|x| x == &insert));
         // same serial number
         assert!(!rr_set.insert(same_serial.clone(), 0));
-        assert!(rr_set.records_without_rrsigs().any(|ref x| x == &&insert));
-        assert!(!rr_set
-            .records_without_rrsigs()
-            .any(|ref x| x == &&same_serial));
+        assert!(rr_set.records_without_rrsigs().any(|x| x == &insert));
+        assert!(!rr_set.records_without_rrsigs().any(|x| x == &same_serial));
 
         assert!(rr_set.insert(new_serial.clone(), 0));
         assert!(!rr_set.insert(same_serial.clone(), 0));
         assert!(!rr_set.insert(insert.clone(), 0));
 
-        assert!(rr_set
-            .records_without_rrsigs()
-            .any(|ref x| x == &&new_serial));
-        assert!(!rr_set.records_without_rrsigs().any(|ref x| x == &&insert));
-        assert!(!rr_set
-            .records_without_rrsigs()
-            .any(|ref x| x == &&same_serial));
+        assert!(rr_set.records_without_rrsigs().any(|x| x == &new_serial));
+        assert!(!rr_set.records_without_rrsigs().any(|x| x == &insert));
+        assert!(!rr_set.records_without_rrsigs().any(|x| x == &same_serial));
     }
 
     #[test]
@@ -738,54 +663,44 @@ mod test {
         let new_cname = Name::from_str("w2.example.com.").unwrap();
 
         let record_type = RecordType::CNAME;
-        let mut rr_set = RecordSet::new(&name, record_type, 0);
+        let mut rr_set = RecordSet::new(name.clone(), record_type, 0);
 
-        let insert = Record::new()
-            .set_name(name.clone())
-            .set_ttl(3600)
-            .set_rr_type(RecordType::CNAME)
+        let insert = Record::from_rdata(name.clone(), 3600, RData::CNAME(CNAME(cname)))
             .set_dns_class(DNSClass::IN)
-            .set_data(Some(RData::CNAME(cname)))
             .clone();
-        let new_record = Record::new()
-            .set_name(name)
-            .set_ttl(3600)
-            .set_rr_type(RecordType::CNAME)
+        let new_record = Record::from_rdata(name, 3600, RData::CNAME(CNAME(new_cname)))
             .set_dns_class(DNSClass::IN)
-            .set_data(Some(RData::CNAME(new_cname)))
             .clone();
 
         assert!(rr_set.insert(insert.clone(), 0));
-        assert!(rr_set.records_without_rrsigs().any(|ref x| x == &&insert));
+        assert!(rr_set.records_without_rrsigs().any(|x| x == &insert));
 
         // update the record
         assert!(rr_set.insert(new_record.clone(), 0));
-        assert!(!rr_set.records_without_rrsigs().any(|ref x| x == &&insert));
-        assert!(rr_set
-            .records_without_rrsigs()
-            .any(|ref x| x == &&new_record));
+        assert!(!rr_set.records_without_rrsigs().any(|x| x == &insert));
+        assert!(rr_set.records_without_rrsigs().any(|x| x == &new_record));
     }
 
     #[test]
     fn test_remove() {
         let name = Name::from_str("www.example.com.").unwrap();
         let record_type = RecordType::A;
-        let mut rr_set = RecordSet::new(&name, record_type, 0);
+        let mut rr_set = RecordSet::new(name.clone(), record_type, 0);
 
-        let insert = Record::new()
-            .set_name(name.clone())
-            .set_ttl(86400)
-            .set_rr_type(record_type)
-            .set_dns_class(DNSClass::IN)
-            .set_data(Some(RData::A(Ipv4Addr::new(93, 184, 216, 24))))
-            .clone();
-        let insert1 = Record::new()
-            .set_name(name)
-            .set_ttl(86400)
-            .set_rr_type(record_type)
-            .set_dns_class(DNSClass::IN)
-            .set_data(Some(RData::A(Ipv4Addr::new(93, 184, 216, 25))))
-            .clone();
+        let insert = Record::from_rdata(
+            name.clone(),
+            86400,
+            RData::A(Ipv4Addr::new(93, 184, 216, 24).into()),
+        )
+        .set_dns_class(DNSClass::IN)
+        .clone();
+        let insert1 = Record::from_rdata(
+            name,
+            86400,
+            RData::A(Ipv4Addr::new(93, 184, 216, 25).into()),
+        )
+        .set_dns_class(DNSClass::IN)
+        .clone();
 
         assert!(rr_set.insert(insert.clone(), 0));
         assert!(rr_set.insert(insert1.clone(), 0));
@@ -801,14 +716,12 @@ mod test {
     fn test_remove_soa() {
         let name = Name::from_str("www.example.com.").unwrap();
         let record_type = RecordType::SOA;
-        let mut rr_set = RecordSet::new(&name, record_type, 0);
+        let mut rr_set = RecordSet::new(name.clone(), record_type, 0);
 
-        let insert = Record::new()
-            .set_name(name)
-            .set_ttl(3600)
-            .set_rr_type(RecordType::SOA)
-            .set_dns_class(DNSClass::IN)
-            .set_data(Some(RData::SOA(SOA::new(
+        let insert = Record::from_rdata(
+            name,
+            3600,
+            RData::SOA(SOA::new(
                 Name::from_str("sns.dns.icann.org.").unwrap(),
                 Name::from_str("noc.dns.icann.org.").unwrap(),
                 2015082403,
@@ -816,38 +729,36 @@ mod test {
                 3600,
                 1209600,
                 3600,
-            ))))
-            .clone();
+            )),
+        )
+        .set_dns_class(DNSClass::IN)
+        .clone();
 
         assert!(rr_set.insert(insert.clone(), 0));
         assert!(!rr_set.remove(&insert, 0));
-        assert!(rr_set.records_without_rrsigs().any(|ref x| x == &&insert));
+        assert!(rr_set.records_without_rrsigs().any(|x| x == &insert));
     }
 
     #[test]
     fn test_remove_ns() {
         let name = Name::from_str("example.com.").unwrap();
         let record_type = RecordType::NS;
-        let mut rr_set = RecordSet::new(&name, record_type, 0);
+        let mut rr_set = RecordSet::new(name.clone(), record_type, 0);
 
-        let ns1 = Record::new()
-            .set_name(name.clone())
-            .set_ttl(86400)
-            .set_rr_type(RecordType::NS)
-            .set_dns_class(DNSClass::IN)
-            .set_data(Some(RData::NS(
-                Name::from_str("a.iana-servers.net.").unwrap(),
-            )))
-            .clone();
-        let ns2 = Record::new()
-            .set_name(name)
-            .set_ttl(86400)
-            .set_rr_type(RecordType::NS)
-            .set_dns_class(DNSClass::IN)
-            .set_data(Some(RData::NS(
-                Name::from_str("b.iana-servers.net.").unwrap(),
-            )))
-            .clone();
+        let ns1 = Record::from_rdata(
+            name.clone(),
+            86400,
+            RData::NS(NS(Name::from_str("a.iana-servers.net.").unwrap())),
+        )
+        .set_dns_class(DNSClass::IN)
+        .clone();
+        let ns2 = Record::from_rdata(
+            name,
+            86400,
+            RData::NS(NS(Name::from_str("b.iana-servers.net.").unwrap())),
+        )
+        .set_dns_class(DNSClass::IN)
+        .clone();
 
         assert!(rr_set.insert(ns1.clone(), 0));
         assert!(rr_set.insert(ns2.clone(), 0));
@@ -864,15 +775,16 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "dnssec")] // This tests RFC 6975, a DNSSEC-specific feature.
-    #[allow(clippy::blocks_in_if_conditions)]
+    #[cfg(feature = "__dnssec")] // This tests RFC 6975, a DNSSEC-specific feature.
+    #[allow(clippy::blocks_in_conditions)]
     fn test_get_filter() {
-        use crate::rr::dnssec::rdata::DNSSECRData;
-        use crate::rr::dnssec::rdata::SIG;
-        use crate::rr::dnssec::{Algorithm, SupportedAlgorithms};
+        use crate::dnssec::{
+            Algorithm,
+            rdata::{DNSSECRData, RRSIG},
+        };
 
         let name = Name::root();
-        let rsasha256 = SIG::new(
+        let rsasha256 = RRSIG::new(
             RecordType::A,
             Algorithm::RSASHA256,
             0,
@@ -883,7 +795,7 @@ mod test {
             Name::root(),
             vec![],
         );
-        let ecp256 = SIG::new(
+        let ecp256 = RRSIG::new(
             RecordType::A,
             Algorithm::ECDSAP256SHA256,
             0,
@@ -894,7 +806,7 @@ mod test {
             Name::root(),
             vec![],
         );
-        let ecp384 = SIG::new(
+        let ecp384 = RRSIG::new(
             RecordType::A,
             Algorithm::ECDSAP384SHA384,
             0,
@@ -905,7 +817,7 @@ mod test {
             Name::root(),
             vec![],
         );
-        let ed25519 = SIG::new(
+        let ed25519 = RRSIG::new(
             RecordType::A,
             Algorithm::ED25519,
             0,
@@ -917,41 +829,37 @@ mod test {
             vec![],
         );
 
-        let rrsig_rsa = Record::new()
-            .set_name(name.clone())
-            .set_ttl(3600)
-            .set_rr_type(RecordType::RRSIG)
-            .set_dns_class(DNSClass::IN)
-            .set_data(Some(RData::DNSSEC(DNSSECRData::SIG(rsasha256))))
-            .clone();
-        let rrsig_ecp256 = Record::new()
-            .set_name(name.clone())
-            .set_ttl(3600)
-            .set_rr_type(RecordType::RRSIG)
-            .set_dns_class(DNSClass::IN)
-            .set_data(Some(RData::DNSSEC(DNSSECRData::SIG(ecp256))))
-            .clone();
-        let rrsig_ecp384 = Record::new()
-            .set_name(name.clone())
-            .set_ttl(3600)
-            .set_rr_type(RecordType::RRSIG)
-            .set_dns_class(DNSClass::IN)
-            .set_data(Some(RData::DNSSEC(DNSSECRData::SIG(ecp384))))
-            .clone();
-        let rrsig_ed25519 = Record::new()
-            .set_name(name.clone())
-            .set_ttl(3600)
-            .set_rr_type(RecordType::RRSIG)
-            .set_dns_class(DNSClass::IN)
-            .set_data(Some(RData::DNSSEC(DNSSECRData::SIG(ed25519))))
-            .clone();
+        let rrsig_rsa = Record::from_rdata(
+            name.clone(),
+            3600,
+            RData::DNSSEC(DNSSECRData::RRSIG(rsasha256)),
+        )
+        .set_dns_class(DNSClass::IN)
+        .clone();
+        let rrsig_ecp256 = Record::from_rdata(
+            name.clone(),
+            3600,
+            RData::DNSSEC(DNSSECRData::RRSIG(ecp256)),
+        )
+        .set_dns_class(DNSClass::IN)
+        .clone();
+        let rrsig_ecp384 = Record::from_rdata(
+            name.clone(),
+            3600,
+            RData::DNSSEC(DNSSECRData::RRSIG(ecp384)),
+        )
+        .set_dns_class(DNSClass::IN)
+        .clone();
+        let rrsig_ed25519 = Record::from_rdata(
+            name.clone(),
+            3600,
+            RData::DNSSEC(DNSSECRData::RRSIG(ed25519)),
+        )
+        .set_dns_class(DNSClass::IN)
+        .clone();
 
-        let a = Record::new()
-            .set_name(name)
-            .set_ttl(3600)
-            .set_rr_type(RecordType::A)
+        let a = Record::from_rdata(name, 3600, RData::A(Ipv4Addr::new(93, 184, 216, 24).into()))
             .set_dns_class(DNSClass::IN)
-            .set_data(Some(RData::A(Ipv4Addr::new(93, 184, 216, 24))))
             .clone();
 
         let mut rrset = RecordSet::from(a);
@@ -960,30 +868,24 @@ mod test {
         rrset.insert_rrsig(rrsig_ecp384);
         rrset.insert_rrsig(rrsig_ed25519);
 
-        assert!(rrset
-            .records_with_rrsigs(SupportedAlgorithms::all(),)
-            .any(
-                |r| if let Some(RData::DNSSEC(DNSSECRData::SIG(ref sig))) = r.data() {
-                    sig.algorithm() == Algorithm::ED25519
-                } else {
-                    false
-                },
-            ));
+        assert!(rrset.records_with_rrsigs().any(|r| {
+            if let RData::DNSSEC(DNSSECRData::RRSIG(sig)) = r.data() {
+                sig.algorithm() == Algorithm::ED25519
+            } else {
+                false
+            }
+        },));
 
-        let mut supported_algorithms = SupportedAlgorithms::new();
-        supported_algorithms.set(Algorithm::ECDSAP384SHA384);
-        assert!(rrset.records_with_rrsigs(supported_algorithms).any(|r| {
-            if let Some(RData::DNSSEC(DNSSECRData::SIG(ref sig))) = r.data() {
+        assert!(rrset.records_with_rrsigs().any(|r| {
+            if let RData::DNSSEC(DNSSECRData::RRSIG(sig)) = r.data() {
                 sig.algorithm() == Algorithm::ECDSAP384SHA384
             } else {
                 false
             }
         }));
 
-        let mut supported_algorithms = SupportedAlgorithms::new();
-        supported_algorithms.set(Algorithm::ED25519);
-        assert!(rrset.records_with_rrsigs(supported_algorithms).any(|r| {
-            if let Some(RData::DNSSEC(DNSSECRData::SIG(ref sig))) = r.data() {
+        assert!(rrset.records_with_rrsigs().any(|r| {
+            if let RData::DNSSEC(DNSSECRData::RRSIG(sig)) = r.data() {
                 sig.algorithm() == Algorithm::ED25519
             } else {
                 false

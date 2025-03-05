@@ -1,8 +1,8 @@
 // Copyright 2015-2017 Benjamin Fry <benjaminfry@me.com>
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
 //! System configuration loading
@@ -21,27 +21,33 @@ use std::time::Duration;
 
 use resolv_conf;
 
-use crate::config::*;
+use crate::ResolveError;
+use crate::config::{NameServerConfig, ResolverConfig, ResolverOpts};
 use crate::proto::rr::Name;
+use crate::proto::xfer::Protocol;
 
 const DEFAULT_PORT: u16 = 53;
 
-pub fn read_system_conf() -> io::Result<(ResolverConfig, ResolverOpts)> {
+pub fn read_system_conf() -> Result<(ResolverConfig, ResolverOpts), ResolveError> {
     read_resolv_conf("/etc/resolv.conf")
 }
 
-fn read_resolv_conf<P: AsRef<Path>>(path: P) -> io::Result<(ResolverConfig, ResolverOpts)> {
+fn read_resolv_conf<P: AsRef<Path>>(
+    path: P,
+) -> Result<(ResolverConfig, ResolverOpts), ResolveError> {
     let mut data = String::new();
     let mut file = File::open(path)?;
     file.read_to_string(&mut data)?;
     parse_resolv_conf(&data)
 }
 
-fn parse_resolv_conf<T: AsRef<[u8]>>(data: T) -> io::Result<(ResolverConfig, ResolverOpts)> {
+pub fn parse_resolv_conf<T: AsRef<[u8]>>(
+    data: T,
+) -> Result<(ResolverConfig, ResolverOpts), ResolveError> {
     let parsed_conf = resolv_conf::Config::parse(&data).map_err(|e| {
         io::Error::new(
             io::ErrorKind::Other,
-            format!("Error parsing resolv.conf: {:?}", e),
+            format!("Error parsing resolv.conf: {e}"),
         )
     })?;
     into_resolver_config(parsed_conf)
@@ -50,9 +56,13 @@ fn parse_resolv_conf<T: AsRef<[u8]>>(data: T) -> io::Result<(ResolverConfig, Res
 // TODO: use a custom parsing error type maybe?
 fn into_resolver_config(
     parsed_config: resolv_conf::Config,
-) -> io::Result<(ResolverConfig, ResolverOpts)> {
+) -> Result<(ResolverConfig, ResolverOpts), ResolveError> {
     let domain = if let Some(domain) = parsed_config.get_system_domain() {
-        Some(Name::from_str(domain.as_str())?)
+        // The system domain name maybe appear to be valid to the resolv_conf
+        // crate but actually be invalid. For example, if the hostname is "matt.schulte's computer"
+        // In order to prevent a hostname which macOS or Windows would consider
+        // valid from returning an error here we turn parse errors to options
+        Name::from_str(domain.as_str()).ok()
     } else {
         None
     };
@@ -64,32 +74,38 @@ fn into_resolver_config(
             socket_addr: SocketAddr::new(ip.into(), DEFAULT_PORT),
             protocol: Protocol::Udp,
             tls_dns_name: None,
-            trust_nx_responses: false,
-            #[cfg(feature = "dns-over-rustls")]
-            tls_config: None,
+            http_endpoint: None,
+            trust_negative_responses: false,
             bind_addr: None,
         });
         nameservers.push(NameServerConfig {
             socket_addr: SocketAddr::new(ip.into(), DEFAULT_PORT),
             protocol: Protocol::Tcp,
             tls_dns_name: None,
-            trust_nx_responses: false,
-            #[cfg(feature = "dns-over-rustls")]
-            tls_config: None,
+            http_endpoint: None,
+            trust_negative_responses: false,
             bind_addr: None,
         });
     }
     if nameservers.is_empty() {
-        warn!("no nameservers found in config");
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "no nameservers found in config",
+        ))?;
     }
 
     // search
     let mut search = vec![];
     for search_domain in parsed_config.get_last_search_or_domain() {
-        search.push(Name::from_str_relaxed(&search_domain).map_err(|e| {
+        // Ignore invalid search domains
+        if search_domain == "--" {
+            continue;
+        }
+
+        search.push(Name::from_str_relaxed(search_domain).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::Other,
-                format!("Error parsing resolv.conf: {:?}", e),
+                format!("Error parsing resolv.conf: {e}"),
             )
         })?);
     }
@@ -100,6 +116,7 @@ fn into_resolver_config(
         ndots: parsed_config.ndots as usize,
         timeout: Duration::from_secs(u64::from(parsed_config.timeout)),
         attempts: parsed_config.attempts as usize,
+        edns0: parsed_config.edns0,
         ..ResolverOpts::default()
     };
 
@@ -109,13 +126,13 @@ fn into_resolver_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proto::rr::Name;
+    use crate::proto::rr::Name;
     use std::env;
     use std::net::*;
     use std::str::FromStr;
 
-    fn empty_config() -> ResolverConfig {
-        ResolverConfig::from_parts(None, vec![], vec![])
+    fn empty_config(name_servers: Vec<NameServerConfig>) -> ResolverConfig {
+        ResolverConfig::from_parts(None, vec![], name_servers)
     }
 
     fn nameserver_config(ip: &str) -> [NameServerConfig; 2] {
@@ -125,18 +142,16 @@ mod tests {
                 socket_addr: addr,
                 protocol: Protocol::Udp,
                 tls_dns_name: None,
-                trust_nx_responses: false,
-                #[cfg(feature = "dns-over-rustls")]
-                tls_config: None,
+                http_endpoint: None,
+                trust_negative_responses: false,
                 bind_addr: None,
             },
             NameServerConfig {
                 socket_addr: addr,
                 protocol: Protocol::Tcp,
                 tls_dns_name: None,
-                trust_nx_responses: false,
-                #[cfg(feature = "dns-over-rustls")]
-                tls_config: None,
+                http_endpoint: None,
+                trust_negative_responses: false,
                 bind_addr: None,
             },
         ]
@@ -144,46 +159,73 @@ mod tests {
 
     fn tests_dir() -> String {
         let server_path = env::var("TDNS_WORKSPACE_ROOT").unwrap_or_else(|_| "../..".to_owned());
-        format!("{}/crates/resolver/tests", server_path)
+        format!("{server_path}/crates/resolver/tests")
     }
 
     #[test]
     #[allow(clippy::redundant_clone)]
     fn test_name_server() {
         let parsed = parse_resolv_conf("nameserver 127.0.0.1").expect("failed");
-        let mut cfg = empty_config();
-        let nameservers = nameserver_config("127.0.0.1");
-        cfg.add_name_server(nameservers[0].clone());
-        cfg.add_name_server(nameservers[1].clone());
-        assert_eq!(cfg.name_servers(), parsed.0.name_servers());
-        assert_eq!(ResolverOpts::default(), parsed.1);
+        let cfg = empty_config(nameserver_config("127.0.0.1").to_vec());
+        assert_eq!(
+            cfg.name_servers()[0].socket_addr,
+            parsed.0.name_servers()[0].socket_addr
+        );
+        is_default_opts(parsed.1);
     }
 
     #[test]
     fn test_search() {
-        let parsed = parse_resolv_conf("search localnet.").expect("failed");
-        let mut cfg = empty_config();
+        let parsed = parse_resolv_conf("search localnet.\nnameserver 127.0.0.1").expect("failed");
+        let mut cfg = empty_config(nameserver_config("127.0.0.1").to_vec());
         cfg.add_search(Name::from_str("localnet.").unwrap());
         assert_eq!(cfg.search(), parsed.0.search());
-        assert_eq!(ResolverOpts::default(), parsed.1);
+        is_default_opts(parsed.1);
+    }
+
+    #[test]
+    fn test_skips_invalid_search() {
+        let parsed =
+            parse_resolv_conf("\n\nnameserver 127.0.0.53\noptions edns0 trust-ad\nsearch -- lan\n")
+                .expect("failed");
+        let mut cfg = empty_config(nameserver_config("127.0.0.53").to_vec());
+
+        {
+            assert_eq!(
+                cfg.name_servers()[0].socket_addr,
+                parsed.0.name_servers()[0].socket_addr
+            );
+            is_default_opts(parsed.1);
+        }
+
+        // This is the important part, that the invalid `--` is skipped during parsing
+        {
+            cfg.add_search(Name::from_str("lan").unwrap());
+            assert_eq!(cfg.search(), parsed.0.search());
+        }
     }
 
     #[test]
     fn test_underscore_in_search() {
-        let parsed = parse_resolv_conf("search Speedport_000").expect("failed");
-        let mut cfg = empty_config();
-        cfg.add_search(Name::from_str_relaxed("Speedport_000.").unwrap());
+        let parsed =
+            parse_resolv_conf("search Speedport_000\nnameserver 127.0.0.1").expect("failed");
+        let mut cfg = empty_config(nameserver_config("127.0.0.1").to_vec());
+        cfg.add_search(Name::from_str_relaxed("Speedport_000").unwrap());
         assert_eq!(cfg.search(), parsed.0.search());
-        assert_eq!(ResolverOpts::default(), parsed.1);
+        is_default_opts(parsed.1);
     }
 
     #[test]
     fn test_domain() {
-        let parsed = parse_resolv_conf("domain example.com").expect("failed");
-        let mut cfg = empty_config();
+        let parsed = parse_resolv_conf("domain example.com\nnameserver 127.0.0.1").expect("failed");
+        let mut cfg = empty_config(nameserver_config("127.0.0.1").to_vec());
         cfg.set_domain(Name::from_str("example.com").unwrap());
-        assert_eq!(cfg, parsed.0);
-        assert_eq!(ResolverOpts::default(), parsed.1);
+        assert_eq!(
+            cfg.name_servers()[0].socket_addr,
+            parsed.0.name_servers()[0].socket_addr
+        );
+        assert_eq!(cfg.domain(), parsed.0.domain());
+        is_default_opts(parsed.1);
     }
 
     #[test]
@@ -191,5 +233,12 @@ mod tests {
         read_resolv_conf(format!("{}/resolv.conf-simple", tests_dir())).expect("simple failed");
         read_resolv_conf(format!("{}/resolv.conf-macos", tests_dir())).expect("macos failed");
         read_resolv_conf(format!("{}/resolv.conf-linux", tests_dir())).expect("linux failed");
+    }
+
+    /// Validate that all options set in `into_resolver_config()` are at default values
+    fn is_default_opts(opts: ResolverOpts) {
+        assert_eq!(opts.ndots, 1);
+        assert_eq!(opts.timeout, Duration::from_secs(5));
+        assert_eq!(opts.attempts, 2);
     }
 }

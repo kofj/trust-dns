@@ -1,19 +1,19 @@
 // Copyright 2015-2021 Benjamin Fry <benjaminfry@me.com>
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
 //! record type definitions
+#![allow(clippy::use_self)]
 
-use std::cmp::Ordering;
-use std::convert::From;
-use std::fmt;
-use std::fmt::{Display, Formatter};
-use std::str::FromStr;
+use alloc::string::ToString;
+use core::cmp::Ordering;
+use core::fmt::{self, Display, Formatter};
+use core::str::FromStr;
 
-#[cfg(feature = "serde-config")]
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use crate::error::*;
@@ -26,7 +26,7 @@ use crate::serialize::binary::*;
 /// The type of the resource record.
 ///
 /// This specifies the type of data in the RData field of the Resource Record
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
 #[allow(dead_code)]
 #[non_exhaustive]
@@ -49,7 +49,8 @@ pub enum RecordType {
     CDS,
     /// [RFC 7344](https://tools.ietf.org/html/rfc7344) Child DNSKEY
     CDNSKEY,
-    //  CERT,       // 37 RFC 4398 Certificate record
+    /// [RFC 4398](https://tools.ietf.org/html/rfc4398) Storing Certificates in the Domain Name System (DNS)
+    CERT,
     /// [RFC 1035](https://tools.ietf.org/html/rfc1035) Canonical name record
     CNAME,
     //  DHCID,      // 49 RFC 4701 DHCP identifier
@@ -128,6 +129,12 @@ impl RecordType {
         self == Self::ANY
     }
 
+    /// Returns true if this is a CERT
+    #[inline]
+    pub fn is_cert(self) -> bool {
+        self == Self::CERT
+    }
+
     /// Returns true if this is a CNAME
     #[inline]
     pub fn is_cname(self) -> bool {
@@ -177,6 +184,12 @@ impl RecordType {
         )
     }
 
+    /// Returns true if this is an RRSIG RecordType
+    #[inline]
+    pub fn is_rrsig(self) -> bool {
+        self == Self::RRSIG
+    }
+
     /// Returns true if this is a Zero (unspecified) RecordType
     #[inline]
     pub fn is_zero(self) -> bool {
@@ -191,14 +204,14 @@ impl FromStr for RecordType {
     ///
     /// ```
     /// use std::str::FromStr;
-    /// use trust_dns_proto::rr::record_type::RecordType;
+    /// use hickory_proto::rr::record_type::RecordType;
     ///
     /// let var: RecordType = RecordType::from_str("A").unwrap();
     /// assert_eq!(RecordType::A, var);
     /// ```
     fn from_str(str: &str) -> ProtoResult<Self> {
         // TODO missing stuff?
-        debug_assert!(str.chars().all(|x| char::is_digit(x, 36)));
+        debug_assert!(str.chars().all(|x| !char::is_ascii_lowercase(&x)));
         match str {
             "A" => Ok(Self::A),
             "AAAA" => Ok(Self::AAAA),
@@ -206,6 +219,7 @@ impl FromStr for RecordType {
             "AXFR" => Ok(Self::AXFR),
             "CAA" => Ok(Self::CAA),
             "CDNSKEY" => Ok(Self::CDNSKEY),
+            "CERT" => Ok(Self::CERT),
             "CDS" => Ok(Self::CDS),
             "CNAME" => Ok(Self::CNAME),
             "CSYNC" => Ok(Self::CSYNC),
@@ -242,7 +256,7 @@ impl From<u16> for RecordType {
     /// Convert from `u16` to `RecordType`
     ///
     /// ```
-    /// use trust_dns_proto::rr::record_type::RecordType;
+    /// use hickory_proto::rr::record_type::RecordType;
     ///
     /// let var = RecordType::from(1);
     /// assert_eq!(RecordType::A, var);
@@ -251,7 +265,7 @@ impl From<u16> for RecordType {
         match value {
             1 => Self::A,
             28 => Self::AAAA,
-            // TODO: wrong value here, see https://github.com/bluejekyll/trust-dns/issues/723
+            // TODO: wrong value here, see https://github.com/hickory-dns/hickory-dns/issues/723
             65305 => Self::ANAME,
             255 => Self::ANY,
             251 => Self::IXFR,
@@ -259,6 +273,7 @@ impl From<u16> for RecordType {
             257 => Self::CAA,
             59 => Self::CDS,
             60 => Self::CDNSKEY,
+            37 => Self::CERT,
             5 => Self::CNAME,
             62 => Self::CSYNC,
             48 => Self::DNSKEY,
@@ -298,7 +313,7 @@ impl BinEncodable for RecordType {
     }
 }
 
-impl<'r> BinDecodable<'r> for RecordType {
+impl BinDecodable<'_> for RecordType {
     fn read(decoder: &mut BinDecoder<'_>) -> ProtoResult<Self> {
         Ok(decoder
             .read_u16()
@@ -314,8 +329,7 @@ impl<'r> BinDecodable<'r> for RecordType {
 /// Convert from `RecordType` to `&str`
 ///
 /// ```
-/// use std::convert::From;
-/// use trust_dns_proto::rr::record_type::RecordType;
+/// use hickory_proto::rr::record_type::RecordType;
 ///
 /// let var: &'static str = From::from(RecordType::A);
 /// assert_eq!("A", var);
@@ -333,6 +347,7 @@ impl From<RecordType> for &'static str {
             RecordType::AXFR => "AXFR",
             RecordType::CAA => "CAA",
             RecordType::CDNSKEY => "CDNSKEY",
+            RecordType::CERT => "CERT",
             RecordType::CDS => "CDS",
             RecordType::CNAME => "CNAME",
             RecordType::CSYNC => "CSYNC",
@@ -370,8 +385,7 @@ impl From<RecordType> for &'static str {
 /// Convert from `RecordType` to `u16`
 ///
 /// ```
-/// use std::convert::From;
-/// use trust_dns_proto::rr::record_type::RecordType;
+/// use hickory_proto::rr::record_type::RecordType;
 ///
 /// let var: u16 = RecordType::A.into();
 /// assert_eq!(1, var);
@@ -381,12 +395,13 @@ impl From<RecordType> for u16 {
         match rt {
             RecordType::A => 1,
             RecordType::AAAA => 28,
-            // TODO: wrong value here, see https://github.com/bluejekyll/trust-dns/issues/723
+            // TODO: wrong value here, see https://github.com/hickory-dns/hickory-dns/issues/723
             RecordType::ANAME => 65305,
             RecordType::ANY => 255,
             RecordType::AXFR => 252,
             RecordType::CAA => 257,
             RecordType::CDNSKEY => 60,
+            RecordType::CERT => 37,
             RecordType::CDS => 59,
             RecordType::CNAME => 5,
             RecordType::CSYNC => 62,
@@ -445,6 +460,8 @@ impl Display for RecordType {
 mod tests {
     #![allow(clippy::dbg_macro, clippy::print_stdout)]
 
+    use std::println;
+
     use super::*;
 
     #[test]
@@ -461,6 +478,7 @@ mod tests {
             RecordType::TXT,
             RecordType::AAAA,
             RecordType::SRV,
+            RecordType::CERT,
             RecordType::CSYNC,
             RecordType::AXFR,
             RecordType::ANY,
@@ -477,6 +495,7 @@ mod tests {
             RecordType::PTR,
             RecordType::MX,
             RecordType::CNAME,
+            RecordType::CERT,
             RecordType::TXT,
             RecordType::AAAA,
             RecordType::HINFO,
@@ -501,6 +520,7 @@ mod tests {
             "AAAA",
             "ANAME",
             "CAA",
+            "CERT",
             "CNAME",
             "CSYNC",
             "HINFO",
@@ -519,7 +539,7 @@ mod tests {
             "AXFR",
         ];
 
-        #[cfg(feature = "dnssec")]
+        #[cfg(feature = "__dnssec")]
         let dnssec_record_names = &[
             "CDNSKEY",
             "CDS",
@@ -533,7 +553,7 @@ mod tests {
             "SIG",
             "TSIG",
         ];
-        #[cfg(not(feature = "dnssec"))]
+        #[cfg(not(feature = "__dnssec"))]
         let dnssec_record_names = &[];
 
         let mut rtypes = std::collections::HashSet::new();
@@ -542,5 +562,11 @@ mod tests {
             assert_eq!(rtype.to_string().to_ascii_uppercase().as_str(), *name);
             assert!(rtypes.insert(rtype));
         }
+    }
+
+    #[test]
+    fn check_record_type_parse_wont_panic_with_symbols() {
+        let dns_class = "a-b-c".to_ascii_uppercase().parse::<RecordType>();
+        assert!(matches!(&dns_class, Err(ProtoError { .. })));
     }
 }

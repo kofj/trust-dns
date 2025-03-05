@@ -1,28 +1,20 @@
 // Copyright 2015-2021 Benjamin Fry <benjaminfry@me.com>
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
 use crate::{
-    authority::{
-        message_request::{MessageRequest, QueriesEmitAndCount},
-        Queries,
-    },
+    authority::{Queries, message_request::MessageRequest},
     proto::{
-        error::*,
-        op::{
-            message::{self, EmitAndCount},
-            Edns, Header, ResponseCode,
-        },
+        ProtoError,
+        op::{Edns, Header, ResponseCode, message},
         rr::Record,
         serialize::binary::BinEncoder,
     },
     server::ResponseInfo,
 };
-
-use super::message_request::WireQuery;
 
 /// A EncodableMessage with borrowed data for Responses in the Server
 #[derive(Debug)]
@@ -34,7 +26,7 @@ where
     Additionals: Iterator<Item = &'a Record> + Send + 'a,
 {
     header: Header,
-    query: Option<&'q WireQuery>,
+    queries: &'q Queries,
     answers: Answers,
     name_servers: NameServers,
     soa: Soa,
@@ -43,37 +35,7 @@ where
     edns: Option<Edns>,
 }
 
-enum EmptyOrQueries<'q> {
-    Empty,
-    Queries(QueriesEmitAndCount<'q>),
-}
-
-impl<'q> From<Option<&'q Queries>> for EmptyOrQueries<'q> {
-    fn from(option: Option<&'q Queries>) -> Self {
-        option.map_or(EmptyOrQueries::Empty, |q| {
-            EmptyOrQueries::Queries(q.as_emit_and_count())
-        })
-    }
-}
-
-impl<'q> From<Option<&'q WireQuery>> for EmptyOrQueries<'q> {
-    fn from(option: Option<&'q WireQuery>) -> Self {
-        option.map_or(EmptyOrQueries::Empty, |q| {
-            EmptyOrQueries::Queries(q.as_emit_and_count())
-        })
-    }
-}
-
-impl<'q> EmitAndCount for EmptyOrQueries<'q> {
-    fn emit(&mut self, encoder: &mut BinEncoder<'_>) -> ProtoResult<usize> {
-        match self {
-            EmptyOrQueries::Empty => Ok(0),
-            EmptyOrQueries::Queries(q) => q.emit(encoder),
-        }
-    }
-}
-
-impl<'q, 'a, A, N, S, D> MessageResponse<'q, 'a, A, N, S, D>
+impl<'a, A, N, S, D> MessageResponse<'_, 'a, A, N, S, D>
 where
     A: Iterator<Item = &'a Record> + Send + 'a,
     N: Iterator<Item = &'a Record> + Send + 'a,
@@ -85,20 +47,33 @@ where
         &self.header
     }
 
+    /// Get a mutable reference to the header
+    pub fn header_mut(&mut self) -> &mut Header {
+        &mut self.header
+    }
+
     /// Set the EDNS options for the Response
     pub fn set_edns(&mut self, edns: Edns) -> &mut Self {
         self.edns = Some(edns);
         self
     }
 
+    /// Gets a reference to the EDNS options for the Response.
+    pub fn get_edns(&self) -> &Option<Edns> {
+        &self.edns
+    }
+
     /// Consumes self, and emits to the encoder.
-    pub fn destructive_emit(mut self, encoder: &mut BinEncoder<'_>) -> ProtoResult<ResponseInfo> {
+    pub fn destructive_emit(
+        mut self,
+        encoder: &mut BinEncoder<'_>,
+    ) -> Result<ResponseInfo, ProtoError> {
         // soa records are part of the nameserver section
         let mut name_servers = self.name_servers.chain(self.soa);
 
         message::emit_message_parts(
             &self.header,
-            &mut EmptyOrQueries::from(self.query),
+            &mut self.queries.as_emit_and_count(),
             &mut self.answers,
             &mut name_servers,
             &mut self.additionals,
@@ -112,7 +87,7 @@ where
 
 /// A builder for MessageResponses
 pub struct MessageResponseBuilder<'q> {
-    query: Option<&'q WireQuery>,
+    queries: &'q Queries,
     sig0: Option<Vec<Record>>,
     edns: Option<Edns>,
 }
@@ -122,10 +97,10 @@ impl<'q> MessageResponseBuilder<'q> {
     ///
     /// # Arguments
     ///
-    /// * `query` - any optional query (from the Request) to associate with the Response
-    pub(crate) fn new(query: Option<&'q WireQuery>) -> MessageResponseBuilder<'q> {
+    /// * `queries` - queries (from the Request) to associate with the Response
+    pub(crate) fn new(queries: &'q Queries) -> Self {
         MessageResponseBuilder {
-            query,
+            queries,
             sig0: None,
             edns: None,
         }
@@ -137,7 +112,7 @@ impl<'q> MessageResponseBuilder<'q> {
     ///
     /// * `message` - original request message to associate with the response
     pub fn from_message_request(message: &'q MessageRequest) -> Self {
-        Self::new(Some(message.raw_query()))
+        Self::new(message.raw_queries())
     }
 
     /// Associate EDNS with the Response
@@ -171,7 +146,7 @@ impl<'q> MessageResponseBuilder<'q> {
     {
         MessageResponse {
             header,
-            query: self.query,
+            queries: self.queries,
             answers: answers.into_iter(),
             name_servers: name_servers.into_iter(),
             soa: soa.into_iter(),
@@ -195,7 +170,7 @@ impl<'q> MessageResponseBuilder<'q> {
     > {
         MessageResponse {
             header,
-            query: self.query,
+            queries: self.queries,
             answers: Box::new(None.into_iter()),
             name_servers: Box::new(None.into_iter()),
             soa: Box::new(None.into_iter()),
@@ -229,7 +204,7 @@ impl<'q> MessageResponseBuilder<'q> {
 
         MessageResponse {
             header,
-            query: self.query,
+            queries: self.queries,
             answers: Box::new(None.into_iter()),
             name_servers: Box::new(None.into_iter()),
             soa: Box::new(None.into_iter()),
@@ -259,15 +234,17 @@ mod tests {
             let mut encoder = BinEncoder::new(&mut buf);
             encoder.set_max_size(512);
 
-            let answer = Record::new()
-                .set_name(Name::from_str("www.example.com.").unwrap())
-                .set_data(Some(RData::A(Ipv4Addr::new(93, 184, 216, 34))))
-                .set_dns_class(DNSClass::NONE)
-                .clone();
+            let answer = Record::from_rdata(
+                Name::from_str("www.example.com.").unwrap(),
+                0,
+                RData::A(Ipv4Addr::new(93, 184, 215, 14).into()),
+            )
+            .set_dns_class(DNSClass::NONE)
+            .clone();
 
             let message = MessageResponse {
                 header: Header::new(),
-                query: None,
+                queries: &Queries::empty(),
                 answers: iter::repeat(&answer),
                 name_servers: iter::once(&answer),
                 soa: iter::once(&answer),
@@ -295,15 +272,17 @@ mod tests {
             let mut encoder = BinEncoder::new(&mut buf);
             encoder.set_max_size(512);
 
-            let answer = Record::new()
-                .set_name(Name::from_str("www.example.com.").unwrap())
-                .set_data(Some(RData::A(Ipv4Addr::new(93, 184, 216, 34))))
-                .set_dns_class(DNSClass::NONE)
-                .clone();
+            let answer = Record::from_rdata(
+                Name::from_str("www.example.com.").unwrap(),
+                0,
+                RData::A(Ipv4Addr::new(93, 184, 215, 14).into()),
+            )
+            .set_dns_class(DNSClass::NONE)
+            .clone();
 
             let message = MessageResponse {
                 header: Header::new(),
-                query: None,
+                queries: &Queries::empty(),
                 answers: iter::empty(),
                 name_servers: iter::repeat(&answer),
                 soa: iter::repeat(&answer),
@@ -321,5 +300,60 @@ mod tests {
         assert!(response.header().truncated());
         assert_eq!(response.answer_count(), 0);
         assert!(response.name_server_count() > 1);
+    }
+
+    // https://github.com/hickory-dns/hickory-dns/issues/2210
+    // If a client sends this DNS request to the hickory 0.24.0 DNS server:
+    //
+    // 08 00 00 00 00 01 00 00 00 00 00 00 c0 00 00 00 00 00 00 00 00 00 00
+    // 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+    // 00 00
+    //
+    // i.e.:
+    // 08 00 ID
+    // 00 00 flags
+    // 00 01 QDCOUNT
+    // 00 00 ANCOUNT
+    // 00 00 NSCOUNT
+    // 00 00 ARCOUNT
+    // c0 00 QNAME
+    // 00 00 QTYPE
+    // 00 00 QCLASS
+    //
+    // hickory-dns fails the 2nd assert here while building the reply message
+    // (really while remembering names for pointers):
+    //
+    // pub fn slice_of(&self, start: usize, end: usize) -> &[u8] {
+    //     assert!(start < self.offset);
+    //     assert!(end <= self.buffer.len());
+    //     &self.buffer.buffer()[start..end]
+    // }
+    // The name is eight bytes long, but the current message size (after the
+    // current offset of 12) is only six, because QueriesEmitAndCount::emit()
+    // stored just the six bytes of the original encoded query:
+    //
+    //     encoder.emit_vec(self.cached_serialized)?;
+    #[test]
+    fn bad_length_of_named_pointers() {
+        use hickory_proto::serialize::binary::BinDecodable;
+
+        let mut buf = Vec::with_capacity(512);
+        let mut encoder = BinEncoder::new(&mut buf);
+
+        let data: &[u8] = &[
+            0x08u8, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+
+        let msg = MessageRequest::from_bytes(data).unwrap();
+
+        eprintln!("queries: {:?}", msg.queries());
+
+        MessageResponseBuilder::new(msg.raw_queries())
+            .build_no_records(Header::response_from_request(msg.header()))
+            .destructive_emit(&mut encoder)
+            .unwrap();
     }
 }

@@ -1,45 +1,47 @@
 // Copyright 2015-2021 Benjamin Fry <benjaminfry@me.com>
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
 use std::io;
 
-use log::{debug, info};
-use trust_dns_proto::xfer::DnsRequestOptions;
+use hickory_resolver::{
+    config::ResolveHosts,
+    name_server::{ConnectionProvider, TokioConnectionProvider},
+};
+use tracing::{debug, info};
 
+#[cfg(feature = "__dnssec")]
+use crate::{authority::Nsec3QueryInfo, dnssec::NxProofKind};
 use crate::{
     authority::{
-        Authority, LookupError, LookupObject, LookupOptions, MessageRequest, UpdateResult, ZoneType,
+        Authority, LookupControlFlow, LookupError, LookupObject, LookupOptions, MessageRequest,
+        UpdateResult, ZoneType,
     },
-    client::{
+    proto::{
         op::ResponseCode,
         rr::{LowerName, Name, Record, RecordType},
     },
-    resolver::{
-        config::ResolverConfig, lookup::Lookup as ResolverLookup, TokioAsyncResolver, TokioHandle,
-    },
+    resolver::{Resolver, config::ResolverConfig, lookup::Lookup as ResolverLookup},
     server::RequestInfo,
     store::forwarder::ForwardConfig,
 };
 
 /// An authority that will forward resolutions to upstream resolvers.
 ///
-/// This uses the trust-dns-resolver for resolving requests.
-pub struct ForwardAuthority {
+/// This uses the hickory-resolver crate for resolving requests.
+pub struct ForwardAuthority<P: ConnectionProvider = TokioConnectionProvider> {
     origin: LowerName,
-    resolver: TokioAsyncResolver,
+    resolver: Resolver<P>,
 }
 
-impl ForwardAuthority {
-    /// TODO: change this name to create or something
-    #[allow(clippy::new_without_default)]
+impl<P: ConnectionProvider> ForwardAuthority<P> {
     #[doc(hidden)]
-    pub async fn new(runtime: TokioHandle) -> Result<Self, String> {
-        let resolver = TokioAsyncResolver::from_system_conf(runtime)
-            .map_err(|e| format!("error constructing new Resolver: {}", e))?;
+    pub fn new(runtime: P) -> Result<Self, String> {
+        let resolver = Resolver::from_system_conf(runtime)
+            .map_err(|e| format!("error constructing new Resolver: {e}"))?;
 
         Ok(Self {
             origin: Name::root().into(),
@@ -48,15 +50,16 @@ impl ForwardAuthority {
     }
 
     /// Read the Authority for the origin from the specified configuration
-    pub async fn try_from_config(
+    pub fn try_from_runtime(
         origin: Name,
         _zone_type: ZoneType,
         config: &ForwardConfig,
+        runtime: P,
     ) -> Result<Self, String> {
         info!("loading forwarder config: {}", origin);
 
         let name_servers = config.name_servers.clone();
-        let mut options = config.options.unwrap_or_default();
+        let mut options = config.options.clone().unwrap_or_default();
 
         // See RFC 1034, Section 4.3.2:
         // "If the data at the node is a CNAME, and QTYPE doesn't match
@@ -67,20 +70,25 @@ impl ForwardAuthority {
         // Essentially, it's saying that servers (including forwarders)
         // should emit any found CNAMEs in a response ("copy the CNAME
         // RR into the answer section"). This is the behavior that
-        // preserve_intemediates enables when set to true, and disables
+        // preserve_intermediates enables when set to true, and disables
         // when set to false. So we set it to true.
         if !options.preserve_intermediates {
-            log::warn!(
+            tracing::warn!(
                 "preserve_intermediates set to false, which is invalid \
                 for a forwarder; switching to true"
             );
             options.preserve_intermediates = true;
         }
 
+        // Require people to explicitly request for /etc/hosts usage in forwarder
+        // configs
+        if options.use_hosts_file == ResolveHosts::Auto {
+            options.use_hosts_file = ResolveHosts::Never;
+        }
+
         let config = ResolverConfig::from_parts(None, vec![], name_servers);
 
-        let resolver = TokioAsyncResolver::new(config, options, TokioHandle)
-            .map_err(|e| format!("error constructing new Resolver: {}", e))?;
+        let resolver = Resolver::new(config, options, runtime);
 
         info!("forward resolver configured: {}: ", origin);
 
@@ -92,13 +100,29 @@ impl ForwardAuthority {
     }
 }
 
+impl ForwardAuthority<TokioConnectionProvider> {
+    /// Read the Authority for the origin from the specified configuration
+    pub fn try_from_config(
+        origin: Name,
+        zone_type: ZoneType,
+        config: &ForwardConfig,
+    ) -> Result<Self, String> {
+        Self::try_from_runtime(
+            origin,
+            zone_type,
+            config,
+            TokioConnectionProvider::default(),
+        )
+    }
+}
+
 #[async_trait::async_trait]
-impl Authority for ForwardAuthority {
+impl<P: ConnectionProvider> Authority for ForwardAuthority<P> {
     type Lookup = ForwardLookup;
 
-    /// Always Forward
+    /// Always External
     fn zone_type(&self) -> ZoneType {
-        ZoneType::Forward
+        ZoneType::External
     }
 
     /// Always false for Forward zones
@@ -125,25 +149,29 @@ impl Authority for ForwardAuthority {
         name: &LowerName,
         rtype: RecordType,
         _lookup_options: LookupOptions,
-    ) -> Result<Self::Lookup, LookupError> {
+    ) -> LookupControlFlow<Self::Lookup> {
         // TODO: make this an error?
         debug_assert!(self.origin.zone_of(name));
 
         debug!("forwarding lookup: {} {}", name, rtype);
-        let name: LowerName = name.clone();
-        let resolve = self
-            .resolver
-            .lookup(name, rtype, DnsRequestOptions::default())
-            .await;
 
-        resolve.map(ForwardLookup).map_err(LookupError::from)
+        // Ignore FQDN when we forward DNS queries. Without this we can't look
+        // up addresses from system hosts file.
+        let mut name: Name = name.clone().into();
+        name.set_fqdn(false);
+
+        use LookupControlFlow::*;
+        match self.resolver.lookup(name, rtype).await {
+            Ok(lookup) => Continue(Ok(ForwardLookup(lookup))),
+            Err(e) => Continue(Err(LookupError::from(e))),
+        }
     }
 
     async fn search(
         &self,
         request_info: RequestInfo<'_>,
         lookup_options: LookupOptions,
-    ) -> Result<Self::Lookup, LookupError> {
+    ) -> LookupControlFlow<Self::Lookup> {
         self.lookup(
             request_info.query.name(),
             request_info.query.query_type(),
@@ -156,15 +184,35 @@ impl Authority for ForwardAuthority {
         &self,
         _name: &LowerName,
         _lookup_options: LookupOptions,
-    ) -> Result<Self::Lookup, LookupError> {
-        Err(LookupError::from(io::Error::new(
+    ) -> LookupControlFlow<Self::Lookup> {
+        LookupControlFlow::Continue(Err(LookupError::from(io::Error::new(
             io::ErrorKind::Other,
             "Getting NSEC records is unimplemented for the forwarder",
-        )))
+        ))))
+    }
+
+    #[cfg(feature = "__dnssec")]
+    async fn get_nsec3_records(
+        &self,
+        _info: Nsec3QueryInfo<'_>,
+        _lookup_options: LookupOptions,
+    ) -> LookupControlFlow<Self::Lookup> {
+        LookupControlFlow::Continue(Err(LookupError::from(io::Error::new(
+            io::ErrorKind::Other,
+            "getting NSEC3 records is unimplemented for the forwarder",
+        ))))
+    }
+
+    #[cfg(feature = "__dnssec")]
+    fn nx_proof_kind(&self) -> Option<&NxProofKind> {
+        None
     }
 }
 
-pub struct ForwardLookup(ResolverLookup);
+/// A structure that holds the results of a forwarding lookup.
+///
+/// This exposes an iterator interface for consumption downstream.
+pub struct ForwardLookup(pub ResolverLookup);
 
 impl LookupObject for ForwardLookup {
     fn is_empty(&self) -> bool {

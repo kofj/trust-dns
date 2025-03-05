@@ -1,11 +1,11 @@
 // Copyright 2015-2019 Benjamin Fry <benjaminfry@me.com>
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-#![allow(deprecated)]
+#![allow(deprecated, clippy::use_self)]
 
 use serde::{Deserialize, Serialize};
 
@@ -22,10 +22,8 @@ pub enum ZoneType {
     /// A secondary, i.e. replicated from the Primary
     #[deprecated = "please read about Juneteenth"]
     Slave,
-    /// A cached zone with recursive resolver abilities
-    Hint,
-    /// A cached zone where all requests are forwarded to another Resolver
-    Forward,
+    /// A cached zone that queries other nameservers
+    External,
 }
 
 impl ZoneType {
@@ -33,7 +31,7 @@ impl ZoneType {
     pub fn is_authoritative(self) -> bool {
         matches!(
             self,
-            ZoneType::Primary | ZoneType::Secondary | ZoneType::Master | ZoneType::Slave
+            Self::Primary | Self::Secondary | Self::Master | Self::Slave
         )
     }
 }

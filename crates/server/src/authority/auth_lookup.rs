@@ -1,8 +1,8 @@
 // Copyright 2015-2017 Benjamin Fry <benjaminfry@me.com>
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
 use std::iter::Chain;
@@ -11,9 +11,11 @@ use std::sync::Arc;
 
 use cfg_if::cfg_if;
 
+#[cfg(feature = "__dnssec")]
+use crate::{authority::DnssecSummary, proto::dnssec::Proof};
+
 use crate::authority::{LookupObject, LookupOptions};
-use crate::client::rr::LowerName;
-use crate::proto::rr::{Record, RecordSet, RecordType, RrsetRecords};
+use crate::proto::rr::{LowerName, Record, RecordSet, RecordType, RrsetRecords};
 
 /// The result of a lookup on an Authority
 ///
@@ -79,7 +81,7 @@ impl AuthLookup {
     pub fn unwrap_records(self) -> LookupRecords {
         match self {
             // TODO: this is ugly, what about the additionals?
-            AuthLookup::Records { answers, .. } => answers,
+            Self::Records { answers, .. } => answers,
             _ => LookupRecords::default(),
         }
     }
@@ -87,10 +89,7 @@ impl AuthLookup {
     /// Takes the additional records, leaving behind None
     pub fn take_additionals(&mut self) -> Option<LookupRecords> {
         match self {
-            AuthLookup::Records {
-                ref mut additionals,
-                ..
-            } => additionals.take(),
+            Self::Records { additionals, .. } => additionals.take(),
             _ => None,
         }
     }
@@ -109,6 +108,25 @@ impl LookupObject for AuthLookup {
     fn take_additionals(&mut self) -> Option<Box<dyn LookupObject>> {
         let additionals = Self::take_additionals(self);
         additionals.map(|a| Box::new(a) as Box<dyn LookupObject>)
+    }
+
+    #[cfg(feature = "__dnssec")]
+    fn dnssec_summary(&self) -> DnssecSummary {
+        let mut all_secure = None;
+        for record in self {
+            match record.proof() {
+                Proof::Secure => {
+                    all_secure.get_or_insert(true);
+                }
+                Proof::Bogus => return DnssecSummary::Bogus,
+                _ => all_secure = Some(false),
+            }
+        }
+
+        match all_secure {
+            Some(true) => DnssecSummary::Secure,
+            _ => DnssecSummary::Insecure,
+        }
     }
 }
 
@@ -140,8 +158,10 @@ impl<'a> IntoIterator for &'a AuthLookup {
 
 /// An iterator over an Authority Lookup
 #[allow(clippy::large_enum_variant)]
+#[derive(Default)]
 pub enum AuthLookupIter<'r> {
     /// The empty set
+    #[default]
     Empty,
     /// An iteration over a set of Records
     Records(LookupRecordsIter<'r>),
@@ -158,12 +178,6 @@ impl<'r> Iterator for AuthLookupIter<'r> {
             AuthLookupIter::Records(i) => i.next(),
             AuthLookupIter::AXFR(i) => i.next(),
         }
-    }
-}
-
-impl<'a> Default for AuthLookupIter<'a> {
-    fn default() -> Self {
-        AuthLookupIter::Empty
     }
 }
 
@@ -252,7 +266,7 @@ impl<'r> Iterator for AnyRecordsIter<'r> {
         let query_name = self.query_name;
 
         loop {
-            if let Some(ref mut records) = self.records {
+            if let Some(records) = &mut self.records {
                 let record = records
                     .by_ref()
                     .filter(|rr_set| {
@@ -275,11 +289,11 @@ impl<'r> Iterator for AnyRecordsIter<'r> {
 
             // getting here, we must have exhausted our records from the rrset
             cfg_if! {
-                if #[cfg(feature = "dnssec")] {
+                if #[cfg(feature = "__dnssec")] {
                     self.records = Some(
                         self.rrset
                             .expect("rrset should not be None at this point")
-                            .records(self.lookup_options.is_dnssec(), self.lookup_options.supported_algorithms()),
+                            .records(self.lookup_options.dnssec_ok()),
                     );
                 } else {
                     self.records = Some(self.rrset.expect("rrset should not be None at this point").records_without_rrsigs());
@@ -296,7 +310,7 @@ pub enum LookupRecords {
     Empty,
     /// The associate records
     Records {
-        /// LookupOptions for the request, e.g. dnssec and supported algorithms
+        /// LookupOptions for the request, e.g. dnssec
         lookup_options: LookupOptions,
         /// the records found based on the query
         records: Arc<RecordSet>,
@@ -317,7 +331,7 @@ impl LookupRecords {
         }
     }
 
-    /// Construct a new LookupRecords over a set of ResordSets
+    /// Construct a new LookupRecords over a set of RecordSets
     pub fn many(lookup_options: LookupOptions, mut records: Vec<Arc<RecordSet>>) -> Self {
         // we're reversing the records because they are output in reverse order, via pop()
         records.reverse();
@@ -354,12 +368,10 @@ impl<'a> IntoIterator for &'a LookupRecords {
             LookupRecords::Records {
                 lookup_options,
                 records,
-            } => LookupRecordsIter::RecordsIter(
-                lookup_options.rrset_with_supported_algorithms(records),
-            ),
+            } => LookupRecordsIter::RecordsIter(lookup_options.rrset_with_rrigs(records)),
             LookupRecords::ManyRecords(lookup_options, r) => LookupRecordsIter::ManyRecordsIter(
                 r.iter()
-                    .map(|r| lookup_options.rrset_with_supported_algorithms(r))
+                    .map(|r| lookup_options.rrset_with_rrigs(r))
                     .collect(),
                 None,
             ),
@@ -369,6 +381,7 @@ impl<'a> IntoIterator for &'a LookupRecords {
 }
 
 /// Iterator over lookup records
+#[derive(Default)]
 pub enum LookupRecordsIter<'r> {
     /// An iteration over batch record type results
     AnyRecordsIter(AnyRecordsIter<'r>),
@@ -377,13 +390,8 @@ pub enum LookupRecordsIter<'r> {
     /// An iteration over many rrsets
     ManyRecordsIter(Vec<RrsetRecords<'r>>, Option<RrsetRecords<'r>>),
     /// An empty set
+    #[default]
     Empty,
-}
-
-impl<'r> Default for LookupRecordsIter<'r> {
-    fn default() -> Self {
-        LookupRecordsIter::Empty
-    }
 }
 
 impl<'r> Iterator for LookupRecordsIter<'r> {
@@ -394,7 +402,7 @@ impl<'r> Iterator for LookupRecordsIter<'r> {
             LookupRecordsIter::Empty => None,
             LookupRecordsIter::AnyRecordsIter(current) => current.next(),
             LookupRecordsIter::RecordsIter(current) => current.next(),
-            LookupRecordsIter::ManyRecordsIter(set, ref mut current) => loop {
+            LookupRecordsIter::ManyRecordsIter(set, current) => loop {
                 if let Some(o) = current.as_mut().and_then(Iterator::next) {
                     return Some(o);
                 }
